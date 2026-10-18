@@ -189,4 +189,31 @@ test("multi-room: user auth, room creation, player lobby, auto-balance, shuffle 
   assert.ok(aliceLive.body.role.name);
   assert.equal(aliceLive.body.missions.length, 1);
   assert.ok(aliceLive.body.missions[0].title);
+
+  // 10. Supervisor Authentication & Exclusive Capabilities
+  // Normal user tries to access /api/supervisor/rooms -> 403 Forbidden
+  const forbiddenAttempt = await request("/api/supervisor/rooms", { token: gmToken });
+  assert.equal(forbiddenAttempt.status, 403);
+
+  // Login as exclusive Supervisor: xMSalvox
+  const supLogin = await request("/api/auth/login", {
+    method: "POST",
+    body: { username: "xMSalvox", password: "!99xxMSalvoxx99!" },
+  });
+  assert.equal(supLogin.status, 200);
+  assert.equal(supLogin.body.user.is_supervisor, true);
+  assert.equal(supLogin.body.user.username, "xMSalvox");
+  const supToken = supLogin.body.token;
+
+  // Supervisor can view ALL rooms on the platform created by ANY user
+  const allPlatformRooms = await request("/api/supervisor/rooms", { token: supToken });
+  assert.equal(allPlatformRooms.status, 200);
+  assert.ok(allPlatformRooms.body.rooms.length >= 1);
+  assert.ok(allPlatformRooms.body.rooms.some((r) => r.code === roomCode && r.owner_username === "GameMasterMarco"));
+
+  // Supervisor can inspect ANY room's judge state even though they are not the owner
+  const supRoomInspect = await request(`/api/rooms/${roomCode}/judge/state`, { token: supToken });
+  assert.equal(supRoomInspect.status, 200);
+  assert.equal(supRoomInspect.body.room.code, roomCode);
+  assert.equal(supRoomInspect.body.participants.length, 5);
 });

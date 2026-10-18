@@ -410,11 +410,40 @@ function showJudgeAuthView() {
   document.querySelector("#judge-panel").hidden = true;
 }
 
+let supervisorRoomsCache = [];
+let isSupervisorViewing = false;
+
 function showJudgeRoomsView() {
   document.querySelector("#judge-auth-panel").hidden = true;
   document.querySelector("#judge-rooms-manager").hidden = false;
   document.querySelector("#judge-panel").hidden = true;
-  document.querySelector("#judge-username").textContent = currentUser?.username || "Master";
+
+  const isSup = Boolean(currentUser?.is_supervisor);
+  const badge = document.querySelector("#judge-user-badge");
+  const supTabsBar = document.querySelector("#supervisor-tabs-bar");
+
+  if (isSup) {
+    if (badge) {
+      badge.textContent = `🛡️ Supervisore: ${currentUser.username}`;
+      badge.style.background = "#5a189a";
+      badge.style.borderColor = "#9d4edd";
+      badge.style.color = "#ffffff";
+    }
+    if (supTabsBar) supTabsBar.hidden = false;
+  } else {
+    if (badge) {
+      badge.textContent = `Master: ${currentUser?.username || "Master"}`;
+      badge.style.background = "";
+      badge.style.borderColor = "";
+      badge.style.color = "";
+    }
+    if (supTabsBar) supTabsBar.hidden = true;
+    const myRoomsSec = document.querySelector("#my-rooms-section");
+    if (myRoomsSec) myRoomsSec.hidden = false;
+    const supPanel = document.querySelector("#supervisor-rooms-panel");
+    if (supPanel) supPanel.hidden = true;
+  }
+
   loadJudgeRooms();
 }
 
@@ -475,6 +504,99 @@ async function loadJudgeRooms() {
     }
   } catch (err) {
     showToast(err.message);
+  }
+}
+
+async function loadSupervisorRooms() {
+  try {
+    const data = await api("/api/supervisor/rooms");
+    supervisorRoomsCache = data.rooms || [];
+    const badge = document.querySelector("#supervisor-stats-badge");
+    if (badge) badge.textContent = `${supervisorRoomsCache.length} stanze totali sulla piattaforma`;
+    renderSupervisorRooms(supervisorRoomsCache);
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+function renderSupervisorRooms(rooms) {
+  const grid = document.querySelector("#supervisor-rooms-list");
+  if (!grid) return;
+  grid.replaceChildren();
+
+  if (!rooms.length) {
+    grid.innerHTML = `<p class="empty-state" style="grid-column:1/-1;">Nessuna stanza trovata con questi criteri di ricerca.</p>`;
+    return;
+  }
+
+  const statusLabels = {
+    setup: "🟡 In preparazione",
+    running: "🟢 In corso",
+    paused: "⏸️ In pausa",
+    completed: "🏁 Conclusa",
+    terminated: "🛑 Annullata",
+  };
+
+  for (const r of rooms) {
+    const card = document.createElement("div");
+    card.className = "room-card";
+    card.style.border = "1px solid rgba(157, 78, 221, 0.4)";
+    card.style.background = "linear-gradient(180deg, rgba(90, 24, 154, 0.15) 0%, rgba(20, 16, 30, 0.8) 100%)";
+
+    const header = document.createElement("div");
+    header.className = "room-card-header";
+    const title = document.createElement("h4");
+    title.className = "room-card-title";
+    title.textContent = r.name;
+    const code = document.createElement("span");
+    code.className = "room-card-code";
+    code.style.background = "#5a189a";
+    code.style.borderColor = "#9d4edd";
+    code.textContent = r.code;
+    header.append(title, code);
+
+    const meta = document.createElement("div");
+    meta.className = "room-card-meta";
+    const turnInfo = r.status === "running" ? `(Turno ${r.current_turn || 1})` : "";
+    meta.innerHTML = `
+      <div><strong>Game Master:</strong> <span style="color:#d8b4fe;">@${r.owner_username || "Sconosciuto"}</span></div>
+      <div><strong>Stato:</strong> ${statusLabels[r.status] || r.status} ${turnInfo}</div>
+      <div><strong>Presenze:</strong> ${r.participant_count} giocatori · ${r.mission_count || 0} missioni</div>
+    `;
+
+    const actions = document.createElement("div");
+    actions.className = "room-card-actions";
+    const inspectBtn = document.createElement("button");
+    inspectBtn.className = "button primary";
+    inspectBtn.style.background = "linear-gradient(135deg, #7b2cbf 0%, #5a189a 100%)";
+    inspectBtn.style.border = "1px solid #9d4edd";
+    inspectBtn.textContent = "👁️ Ispeziona / Entra in Regia";
+    inspectBtn.addEventListener("click", () => {
+      isSupervisorViewing = true;
+      const supBack = document.querySelector("#supervisor-back-btn");
+      if (supBack) supBack.hidden = false;
+      const normalBack = document.querySelector("#judge-back-to-rooms");
+      if (normalBack) normalBack.hidden = true;
+      enterRoomAsJudge(r.code);
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "button quiet";
+    delBtn.textContent = "🗑️ Elimina";
+    delBtn.addEventListener("click", async () => {
+      if (!window.confirm(`Sei sicuro di voler eliminare la stanza "${r.name}" (${r.code}) creata da @${r.owner_username}?`)) return;
+      try {
+        await api(`/api/supervisor/rooms/${encodeURIComponent(r.code)}`, { method: "DELETE" });
+        showToast(`Stanza ${r.code} eliminata con successo.`);
+        await loadSupervisorRooms();
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+
+    actions.append(inspectBtn, delBtn);
+    card.append(header, meta, actions);
+    grid.append(card);
   }
 }
 
@@ -1439,6 +1561,52 @@ document.querySelector("#judge-back-to-rooms")?.addEventListener("click", () => 
   currentRoomCode = null;
   sessionStorage.removeItem("currentRoomCode");
   showJudgeRoomsView();
+});
+
+// Supervisor Tabs & Actions
+document.querySelector("#tab-my-rooms-btn")?.addEventListener("click", () => {
+  document.querySelector("#my-rooms-section").hidden = false;
+  document.querySelector("#supervisor-rooms-panel").hidden = true;
+  document.querySelector("#tab-my-rooms-btn").className = "button primary";
+  document.querySelector("#tab-supervisor-all-btn").className = "button secondary";
+  loadJudgeRooms();
+});
+
+document.querySelector("#tab-supervisor-all-btn")?.addEventListener("click", () => {
+  document.querySelector("#my-rooms-section").hidden = true;
+  document.querySelector("#supervisor-rooms-panel").hidden = false;
+  document.querySelector("#tab-supervisor-all-btn").className = "button primary";
+  document.querySelector("#tab-my-rooms-btn").className = "button secondary";
+  loadSupervisorRooms();
+});
+
+document.querySelector("#supervisor-refresh-btn")?.addEventListener("click", () => {
+  loadSupervisorRooms();
+  showToast("Elenco globale stanze aggiornato.");
+});
+
+document.querySelector("#supervisor-search-input")?.addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  if (!q) {
+    renderSupervisorRooms(supervisorRoomsCache);
+    return;
+  }
+  const filtered = supervisorRoomsCache.filter(r =>
+    (r.code && r.code.toLowerCase().includes(q)) ||
+    (r.name && r.name.toLowerCase().includes(q)) ||
+    (r.owner_username && r.owner_username.toLowerCase().includes(q))
+  );
+  renderSupervisorRooms(filtered);
+});
+
+document.querySelector("#supervisor-back-btn")?.addEventListener("click", () => {
+  clearInterval(judgeRefresh);
+  currentRoomCode = null;
+  sessionStorage.removeItem("currentRoomCode");
+  document.querySelector("#supervisor-back-btn").hidden = true;
+  document.querySelector("#judge-back-to-rooms").hidden = false;
+  showJudgeRoomsView();
+  document.querySelector("#tab-supervisor-all-btn")?.click();
 });
 
 // Copy room code & link & share

@@ -350,6 +350,12 @@
           </div>
           <p>Crea una stanza per ogni festa o gruppo di amici. I partecipanti useranno il codice stanza a 5 lettere per connettersi dai loro smartphone.</p>
           
+          <!-- TABS SUPERVISORE (VISIBILE SOLO PER SUPERVISORE) -->
+          <div id="supervisor-tabs-bar" hidden style="display:flex; gap:10px; margin-top:18px;">
+            <button id="tab-my-rooms-btn" type="button" class="button primary" style="flex:1;">📂 Le Mie Stanze</button>
+            <button id="tab-supervisor-all-btn" type="button" class="button secondary" style="flex:1;">🛡️ Tutte le Stanze della Piattaforma (Supervisore)</button>
+          </div>
+
           <!-- FORM CREA STANZA -->
           <form id="create-room-form" class="inline-form" style="margin:20px 0 10px;">
             <input id="new-room-name" type="text" maxlength="60" placeholder="Nome della stanza (es. Festa da Marco, Notte del Castello...)" required style="flex:1;">
@@ -358,12 +364,32 @@
           <p id="room-create-message" class="notice" role="status"></p>
         </div>
 
-        <div class="panel" style="margin-top:16px;">
+        <!-- SEZIONE LE MIE STANZE -->
+        <div id="my-rooms-section" class="panel" style="margin-top:16px;">
           <div class="panel-heading">
-            <h3>Stanze attive</h3>
+            <h3>Le tue stanze attive</h3>
             <span id="rooms-count" class="muted">0 stanze</span>
           </div>
           <div id="judge-rooms-list" class="rooms-grid"></div>
+        </div>
+
+        <!-- SEZIONE SUPERVISORE: TUTTE LE STANZE DELLA PIATTAFORMA -->
+        <div id="supervisor-rooms-panel" class="panel" hidden style="margin-top:16px; border:1px solid rgba(138,43,226,0.4);">
+          <div class="panel-heading">
+            <div>
+              <span class="badge" style="background:#5a189a; color:#fff; border-color:#9d4edd;">🛡️ Console Supervisore Globale</span>
+              <h3 style="margin-top:6px;">Tutte le Stanze della Piattaforma</h3>
+            </div>
+            <div class="header-actions">
+              <span id="supervisor-stats-badge" class="muted" style="font-weight:600;">Caricamento...</span>
+              <button id="supervisor-refresh-btn" type="button" class="button secondary" style="padding:6px 12px;">🔄 Aggiorna</button>
+            </div>
+          </div>
+          <p class="muted" style="margin-bottom:16px; font-size:0.9rem;">In qualità di Supervisore unico, puoi monitorare in tempo reale qualunque stanza creata da qualsiasi utente, entrare direttamente nella regia per ispezionare ruoli e messaggi, oppure eliminare le stanze.</p>
+          <div class="inline-form" style="margin-bottom:16px;">
+            <input id="supervisor-search-input" type="search" placeholder="🔍 Filtra per codice stanza, nome o Game Master..." style="flex:1;">
+          </div>
+          <div id="supervisor-rooms-list" class="rooms-grid"></div>
         </div>
       </div>
 
@@ -373,6 +399,7 @@
           <div class="panel-heading">
             <div>
               <button id="judge-back-to-rooms" class="button quiet" type="button" style="padding:4px 10px; margin-bottom:8px;">⬅️ Torna alle mie stanze</button>
+              <button id="supervisor-back-btn" class="button" hidden type="button" style="background:#5a189a; color:#fff; border:1px solid #9d4edd; padding:4px 12px; margin-bottom:8px; border-radius:6px; cursor:pointer;">🛡️ Torna alla Console Supervisore</button>
               <p class="eyebrow">REGIA DELLA STANZA</p>
               <h2 id="current-room-title">Pannello del Giudice</h2>
             </div>
