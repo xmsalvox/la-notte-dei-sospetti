@@ -10,23 +10,11 @@ const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "game.sqlite");
 const JUDGE_PASSWORD_PATH = path.join(DATA_DIR, "judge-password.txt");
-const ROLE_LIMITS = Object.freeze({
-  sentinella: 4,
-  sabotatore: 3,
-  veggente: 1,
-  malcapitato: 12,
-});
-const ROLE_NAMES = Object.freeze({
-  sentinella: "Sentinella",
-  sabotatore: "Sabotatore",
-  veggente: "Veggente",
-  malcapitato: "Malcapitato",
-});
-const ROLE_KEYS = Object.keys(ROLE_NAMES);
 const MAX_BODY_BYTES = 1024 * 1024;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// Legacy / fallback judge password support
 let judgePassword = process.env.JUDGE_PASSWORD;
 if (!judgePassword) {
   if (fs.existsSync(JUDGE_PASSWORD_PATH)) {
@@ -37,23 +25,66 @@ if (!judgePassword) {
   }
 }
 
+// ----------------------------------------------------
+// DATABASE INITIALIZATION & MIGRATIONS
+// ----------------------------------------------------
 const db = new DatabaseSync(DB_PATH);
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS game (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    started_at TEXT
-  );
-  INSERT OR IGNORE INTO game (id, started_at) VALUES (1, NULL);
-  CREATE TABLE IF NOT EXISTS participants (
+
+  CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    role TEXT CHECK (role IS NULL OR role IN ('sentinella', 'sabotatore', 'veggente', 'malcapitato')),
+    username TEXT UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    code TEXT UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'setup' CHECK (status IN ('setup', 'running', 'paused', 'completed', 'terminated')),
+    settings TEXT NOT NULL DEFAULT '{}',
+    current_turn INTEGER NOT NULL DEFAULT 0,
+    turn_started_at TEXT,
+    paused_remaining_ms INTEGER,
+    roles_revealed INTEGER NOT NULL DEFAULT 0,
+    vote_open INTEGER NOT NULL DEFAULT 0,
+    vote_limit INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS game_roles (
+    id TEXT NOT NULL,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0),
+    team TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    objectives TEXT NOT NULL DEFAULT '',
+    rules TEXT NOT NULL DEFAULT '',
+    actions TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, id),
+    UNIQUE (room_id, name COLLATE NOCASE)
+  );
+
+  CREATE TABLE IF NOT EXISTS participants (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    role TEXT,
+    pin TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (room_id, name COLLATE NOCASE)
+  );
+
   CREATE TABLE IF NOT EXISTS role_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     participant_id TEXT NOT NULL,
     participant_name TEXT NOT NULL,
     old_role TEXT,
@@ -61,41 +92,10 @@ db.exec(`
     reason TEXT NOT NULL,
     changed_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS role_config (
-    role TEXT PRIMARY KEY CHECK (role IN ('sentinella', 'sabotatore', 'veggente', 'malcapitato')),
-    target_count INTEGER NOT NULL CHECK (target_count >= 0)
-  );
-  CREATE TABLE IF NOT EXISTS removed_roles (id TEXT PRIMARY KEY);
-`);
-const participantTableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'participants'").get().sql;
-if (participantTableSql.includes("CHECK (role IS NULL OR role IN")) {
-  db.exec(`
-    ALTER TABLE participants RENAME TO participants_legacy;
-    CREATE TABLE participants (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      role TEXT,
-      created_at TEXT NOT NULL
-    );
-    INSERT INTO participants (id, name, role, created_at)
-      SELECT id, name, role, created_at FROM participants_legacy;
-    DROP TABLE participants_legacy;
-  `);
-}
-db.exec(`
-  CREATE TABLE IF NOT EXISTS game_roles (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0),
-    team TEXT NOT NULL DEFAULT '',
-    description TEXT NOT NULL DEFAULT '',
-    objectives TEXT NOT NULL DEFAULT '',
-    rules TEXT NOT NULL DEFAULT '',
-    actions TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-  );
+
   CREATE TABLE IF NOT EXISTS missions (
     id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     objective TEXT NOT NULL DEFAULT '',
@@ -103,7 +103,7 @@ db.exec(`
     verification TEXT NOT NULL DEFAULT '',
     score INTEGER NOT NULL DEFAULT 0 CHECK (score >= 0),
     turn_number INTEGER NOT NULL DEFAULT 1,
-    participant_id TEXT NOT NULL REFERENCES participants(id),
+    participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'assigned'
       CHECK (status IN ('assigned', 'active', 'submitted', 'under_review', 'completed', 'rejected')),
     proof TEXT NOT NULL DEFAULT '',
@@ -112,9 +112,11 @@ db.exec(`
     submitted_at TEXT,
     reviewed_at TEXT
   );
+
   CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
-    participant_id TEXT REFERENCES participants(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    participant_id TEXT REFERENCES participants(id) ON DELETE CASCADE,
     sender TEXT NOT NULL CHECK (sender IN ('judge', 'player')),
     kind TEXT NOT NULL CHECK (kind IN ('message', 'report', 'announcement')),
     subject TEXT NOT NULL DEFAULT '',
@@ -126,9 +128,11 @@ db.exec(`
     review_note TEXT NOT NULL DEFAULT '',
     reviewed_at TEXT
   );
+
   CREATE TABLE IF NOT EXISTS secret_actions (
     id TEXT PRIMARY KEY,
-    participant_id TEXT NOT NULL REFERENCES participants(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     details TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending'
@@ -138,67 +142,302 @@ db.exec(`
     created_at TEXT NOT NULL,
     reviewed_at TEXT
   );
+
   CREATE TABLE IF NOT EXISTS votes (
-    voter_id TEXT NOT NULL REFERENCES participants(id),
-    target_id TEXT NOT NULL REFERENCES participants(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    voter_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    target_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (voter_id, target_id),
+    PRIMARY KEY (room_id, voter_id, target_id),
     CHECK (voter_id != target_id)
   );
+
   CREATE TABLE IF NOT EXISTS score_ledger (
     id TEXT PRIMARY KEY,
-    participant_id TEXT NOT NULL REFERENCES participants(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
     source_type TEXT NOT NULL,
     source_id TEXT NOT NULL,
     points INTEGER NOT NULL,
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    UNIQUE (source_type, source_id)
+    UNIQUE (room_id, source_type, source_id)
   );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     actor TEXT NOT NULL,
     action TEXT NOT NULL,
     details TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
 `);
-const messageColumns = new Set(db.prepare("PRAGMA table_info(messages)").all().map((column) => column.name));
-for (const [name, definition] of [
-  ["status", "TEXT NOT NULL DEFAULT 'sent'"],
-  ["review_note", "TEXT NOT NULL DEFAULT ''"],
-  ["reviewed_at", "TEXT"],
-  ["team", "TEXT"],
-]) {
-  if (!messageColumns.has(name)) db.exec(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
-}
-const saveDefaultRoleCount = db.prepare("INSERT OR IGNORE INTO role_config (role, target_count) VALUES (?, ?)");
-for (const role of ROLE_KEYS) {
-  saveDefaultRoleCount.run(role, ROLE_LIMITS[role]);
-  const target = db.prepare("SELECT target_count FROM role_config WHERE role = ?").get(role).target_count;
-  if (db.prepare("SELECT 1 FROM removed_roles WHERE id = ?").get(role)) continue;
-  db.prepare(`INSERT OR IGNORE INTO game_roles
-    (id, name, target_count, team, description, objectives, rules, actions, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(role, ROLE_NAMES[role], target,
-      role === "sentinella" ? "Sentinelle" : role === "sabotatore" ? "Sabotatori" : "Malcapitati",
-      "", "", "", "", new Date().toISOString());
-}
-const gameColumns = new Set(db.prepare("PRAGMA table_info(game)").all().map((column) => column.name));
-for (const [name, definition] of [
-  ["status", "TEXT NOT NULL DEFAULT 'setup'"],
-  ["settings", "TEXT NOT NULL DEFAULT '{}'"],
-  ["current_turn", "INTEGER NOT NULL DEFAULT 0"],
-  ["turn_started_at", "TEXT"],
-  ["paused_remaining_ms", "INTEGER"],
-  ["roles_revealed", "INTEGER NOT NULL DEFAULT 0"],
-  ["vote_open", "INTEGER NOT NULL DEFAULT 0"],
-  ["vote_limit", "INTEGER NOT NULL DEFAULT 1"],
-]) {
-  if (!gameColumns.has(name)) db.exec(`ALTER TABLE game ADD COLUMN ${name} ${definition}`);
-}
-db.prepare("UPDATE game SET status = CASE WHEN started_at IS NULL THEN 'setup' ELSE 'running' END WHERE status = 'setup' AND started_at IS NOT NULL").run();
 
+// Migration checks for existing databases
+for (const table of ["participants", "role_history", "missions", "messages", "secret_actions", "votes", "score_ledger", "audit_log"]) {
+  const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+  if (tableExists) {
+    const cols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    if (!cols.has("room_id")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN room_id TEXT REFERENCES rooms(id) ON DELETE CASCADE`);
+    }
+    if (table === "participants" && !cols.has("pin")) {
+      db.exec(`ALTER TABLE participants ADD COLUMN pin TEXT`);
+    }
+  }
+}
+
+const gameRolesDef = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'game_roles'").get();
+if (gameRolesDef && !gameRolesDef.sql.includes("room_id")) {
+  db.exec(`
+    ALTER TABLE game_roles RENAME TO game_roles_legacy;
+    CREATE TABLE game_roles (
+      id TEXT NOT NULL,
+      room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0),
+      team TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      objectives TEXT NOT NULL DEFAULT '',
+      rules TEXT NOT NULL DEFAULT '',
+      actions TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (room_id, id),
+      UNIQUE (room_id, name COLLATE NOCASE)
+    );
+    DROP TABLE game_roles_legacy;
+  `);
+}
+
+// ----------------------------------------------------
+// SMART HALLOWEEN CATALOG & PRESETS
+// ----------------------------------------------------
+const HALLOWEEN_ROLE_PRESETS = [
+  {
+    id: "sentinella",
+    name: "Sentinella",
+    target_count: 4,
+    team: "Sentinelle",
+    description: "Guardiani silenziosi della notte. Conoscono gli altri membri della propria squadra e vigilano su mosse sospette.",
+    objectives: "Smascherare e votare tutti i Sabotatori prima dello scadere dei turni.",
+    rules: "Possono comunicare e coordinarsi con le altre Sentinelle in segreto.",
+    actions: "Sorveglianza notturna\nInterroga un sospetto\nScorta protetta",
+  },
+  {
+    id: "sabotatore",
+    name: "Sabotatore",
+    target_count: 3,
+    team: "Sabotatori",
+    description: "Infiltrati nell'ombra. Conoscono i loro complici e agiscono nell'oscurità per seminare il panico.",
+    objectives: "Completare i sabotaggi segreti ed eliminare o sviare i sospetti senza farsi smascherare.",
+    rules: "Agire con discrezione. Non rivelare mai la propria identità ai Malcapitati.",
+    actions: "Sabotaggio furtivo\nFalso indizio\nAlibi falso",
+  },
+  {
+    id: "veggente",
+    name: "Veggente",
+    target_count: 1,
+    team: "Malcapitati",
+    description: "Possiede una dote mistica speciale ma fa parte a tutti gli effetti della squadra dei Malcapitati. NON conosce gli altri alleati in anticipo.",
+    objectives: "Aiutare gli innocenti a identificare i Sabotatori attraverso le proprie visioni.",
+    rules: "Non rivelare subito il proprio potere per evitare di essere presa di mira dai Sabotatori.",
+    actions: "Visione chiaroveggente\nLettura dell'aura\nPresagio oscuro",
+  },
+  {
+    id: "malcapitato",
+    name: "Malcapitato",
+    target_count: 12,
+    team: "Malcapitati",
+    description: "Ospite ignaro della magione. Non ha poteri speciali iniziali, ma con acume e osservazione può salvare tutti.",
+    objectives: "Sopravvivere ai turni, completare le missioni assegnate e votare i veri colpevoli.",
+    rules: "Collaborare con gli altri invitati e segnalare qualsiasi comportamento anomalo al Giudice.",
+    actions: "Ispezione stanza\nRichiesta di chiarimento\nSegnalazione anonima",
+  },
+];
+
+const HALLOWEEN_MISSION_TEMPLATES = [
+  {
+    title: "Il Brindisi Avvelenato",
+    description: "Avvicinati a un gruppo e proponi un brindisi pronunciando chiaramente la parola 'Spettro' prima che tutti bevano.",
+    objective: "Fai brindare almeno 3 persone con te dicendo la parola segreta 'Spettro'.",
+    rules: "Non farti scoprire e non svelare che è una missione assegnata.",
+    verification: "Indica i nomi delle 3 persone che hanno brindato e il momento esatto.",
+    score: 15,
+  },
+  {
+    title: "L'Interrogatorio ad Arte",
+    description: "Fai domande con disinvoltura a due partecipanti per ricostruire i loro spostamenti negli ultimi 10 minuti.",
+    objective: "Scopri e trascrivi l'alibi di due giocatori per i turni precedenti.",
+    rules: "Comportati con naturalezza senza sembrare un inquisitore palese.",
+    verification: "Riporta i nomi dei due interrogati e cosa hanno dichiarato di aver fatto.",
+    score: 15,
+  },
+  {
+    title: "Ombra Silenziosa",
+    description: "Scegli un sospetto e condividi la stessa stanza con lui per almeno 2 minuti consecutivi.",
+    objective: "Resta a distanza ravvicinata dal bersaglio senza rivolgergli mai la parola.",
+    rules: "Se il bersaglio ti parla o si allontana prima dei 2 minuti, la missione fallisce.",
+    verification: "Nome del bersaglio e descrizione di cosa stava facendo in quei minuti.",
+    score: 20,
+  },
+  {
+    title: "Il Patto nel Buio",
+    description: "Convincere un altro partecipante a scambiare una stretta di mano segreta con una parola d'ordine inventata da te.",
+    objective: "Sigla un patto segreto con un partecipante facendogli credere che siete alleati.",
+    rules: "La parola d'ordine deve essere composta da due parole (es. 'Luna Nera').",
+    verification: "Nome del complice e parola d'ordine concordata.",
+    score: 15,
+  },
+  {
+    title: "Il Falso Indizio",
+    description: "Durante una conversazione di gruppo, convinci almeno due persone che un dettaglio insolito della casa nasconda un segreto.",
+    objective: "Semina un dubbio o una falsa pista su un oggetto o angolo della stanza.",
+    rules: "Due giocatori devono commentare seriamente la tua teoria.",
+    verification: "Descrivi la falsa pista creata e chi è caduto nell'inganno.",
+    score: 20,
+  },
+  {
+    title: "Il Testimone Cieco",
+    description: "Fai ammettere apertamente a un sospetto di non ricordare chi sia entrato o uscito per ultimo dalla stanza.",
+    objective: "Metti in crisi la memoria di un partecipante durante una discussione.",
+    rules: "La persona deve pronunciare una frase come 'non ci ho fatto caso' o 'non ricordo chi fosse'.",
+    verification: "Nome del giocatore e frase esatta pronunciata.",
+    score: 15,
+  },
+  {
+    title: "Il Rito di Mezzanotte",
+    description: "Raduna attorno a te almeno 4 persone per raccontare un aneddoto misterioso o una breve storia da brividi.",
+    objective: "Cattura l'attenzione di 4 partecipanti per almeno un minuto intero.",
+    rules: "Nessuno deve abbandonare il cerchio prima del finale della storia.",
+    verification: "Nomi dei 4 partecipanti che hanno ascoltato la storia.",
+    score: 20,
+  },
+  {
+    title: "Il Confessionale",
+    description: "Riesci a farti confidare da un altro partecipante di chi diffida di più in questa partita.",
+    objective: "Fatti rivelare il nome del suo principale sospettato.",
+    rules: "Non devi suggerire tu il nome: deve pronunciarlo spontaneamente il giocatore.",
+    verification: "Nome del giocatore e il nome del suo sospettato rivelato.",
+    score: 15,
+  },
+  {
+    title: "Scambio Furtivo",
+    description: "Fatti prestare un oggetto personale (es. penna, accendino, bicchiere, accessorio) da un altro giocatore e tienilo per 5 minuti.",
+    objective: "Ottieni e custodisci un oggetto di un altro giocatore senza spiegare il motivo.",
+    rules: "L'oggetto deve esserti consegnato spontaneamente, non rubato.",
+    verification: "Oggetto ricevuto e nome del proprietario.",
+    score: 15,
+  },
+  {
+    title: "L'Alibi di Ferro",
+    description: "Fai in modo che altri due giocatori possano testimoniare con certezza che sei rimasto con loro negli ultimi minuti.",
+    objective: "Costruisci un alibi pubblico e inattaccabile per il turno corrente.",
+    rules: "I due testimoni devono essere disposti a confermarlo apertamente al Giudice se interrogati.",
+    verification: "Nomi dei due testimoni che garantiscono per te.",
+    score: 15,
+  },
+  {
+    title: "Il Sussurro nel Buio",
+    description: "Avvicinati a un giocatore e sussurragli all'orecchio: 'Qualcuno nella stanza sa la verità...'.",
+    objective: "Sussurra la frase enigmatica e osserva la sua reazione immediata.",
+    rules: "Fallo con tono misterioso senza farti sentire da altri vicini.",
+    verification: "Nome del giocatore e trascrizione della sua reazione verbale o mimica.",
+    score: 20,
+  },
+  {
+    title: "L'Origliatore",
+    description: "Ascolta una conversazione tra due persone a distanza senza che si accorgano che stai prestando attenzione.",
+    objective: "Intercetta un dettaglio o una frase detta da due persone a colloquio.",
+    rules: "Non unirti alla conversazione né farti scoprire a guardarle fissamente.",
+    verification: "Nomi dei due interlocutori e frammento della conversazione origliata.",
+    score: 25,
+  },
+  {
+    title: "Il Giuramento Solenne",
+    description: "Guarda negli occhi un partecipante e chiedigli se è disposto a giurare sulla sua completa innocenza.",
+    objective: "Fai pronunciare al bersaglio la formula esatta 'Giuro che sono innocente'.",
+    rules: "Se esita o rifiuta di giurare, annotalo come elemento chiave.",
+    verification: "Nome del partecipante e se ha giurato o esitato.",
+    score: 15,
+  },
+  {
+    title: "La Maschera Caduta",
+    description: "Durante una conversazione di gruppo, cambia deliberatamente l'argomento di discussione per ben due volte.",
+    objective: "Devia il discorso per due volte consecutive senza destare sospetti.",
+    rules: "Il gruppo deve seguire spontaneamente il tuo nuovo argomento entrambe le volte.",
+    verification: "I due argomenti introdotti e i partecipanti coinvolti.",
+    score: 20,
+  },
+  {
+    title: "Il Messaggio Cifrato",
+    description: "Lascia un bigliettino con scritto un presagio o un indizio cifrato in un posto visibile (es. tavolo, mensola).",
+    objective: "Fai trovare e leggere il bigliettino a un altro giocatore senza che sappia chi l'ha lasciato.",
+    rules: "Non farti vedere mentre deponi il messaggio.",
+    verification: "Dove hai posato il biglietto e chi lo ha raccolto o letto.",
+    score: 20,
+  },
+];
+
+function seedRoomRoles(roomId) {
+  const insertRole = db.prepare(`INSERT OR REPLACE INTO game_roles
+    (id, room_id, name, target_count, team, description, objectives, rules, actions, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const r of HALLOWEEN_ROLE_PRESETS) {
+    insertRole.run(
+      r.id, roomId, r.name, r.target_count, r.team,
+      r.description, r.objectives, r.rules, r.actions,
+      new Date().toISOString()
+    );
+  }
+}
+
+// ----------------------------------------------------
+// DEFAULT USER & ROOM SETUP (FOR TESTS & LEGACY)
+// ----------------------------------------------------
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, originalHash] = stored.split(":");
+  const testHash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(testHash, "hex"), Buffer.from(originalHash, "hex"));
+}
+
+let defaultUser = db.prepare("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").get();
+if (!defaultUser) {
+  const adminId = crypto.randomUUID();
+  db.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)").run(
+    adminId, "admin", hashPassword(judgePassword), new Date().toISOString()
+  );
+  defaultUser = { id: adminId };
+}
+
+let defaultRoom = db.prepare("SELECT * FROM rooms ORDER BY created_at ASC LIMIT 1").get();
+if (!defaultRoom) {
+  const roomId = crypto.randomUUID();
+  const code = "H4LL0";
+  db.prepare(`INSERT INTO rooms
+    (id, code, name, owner_id, status, settings, current_turn, roles_revealed, vote_open, vote_limit, created_at)
+    VALUES (?, ?, ?, ?, 'setup', '{}', 0, 0, 0, 1, ?)`).run(
+    roomId, code, "Festa di Halloween", defaultUser.id, new Date().toISOString()
+  );
+  seedRoomRoles(roomId);
+  defaultRoom = db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId);
+}
+
+// Attach any existing orphan rows to defaultRoom
+for (const table of ["participants", "role_history", "missions", "messages", "secret_actions", "votes", "score_ledger", "audit_log"]) {
+  db.prepare(`UPDATE ${table} SET room_id = ? WHERE room_id IS NULL`).run(defaultRoom.id);
+}
+
+// ----------------------------------------------------
+// SESSIONS & ROOM HELPERS
+// ----------------------------------------------------
 const roleSecretPath = path.join(DATA_DIR, "role-secret.key");
 let roleSecret;
 if (fs.existsSync(roleSecretPath)) {
@@ -208,24 +447,111 @@ if (fs.existsSync(roleSecretPath)) {
   fs.writeFileSync(roleSecretPath, roleSecret, { flag: "wx", mode: 0o600 });
 }
 
-const judgeSessions = new Set();
+// userSessions: token -> userId
+const userSessions = new Map();
+// judgeSessions: token -> { userId, activeRoomId }
+const judgeSessions = new Map();
+// playerSessions: token -> { participantId, roomId }
 const playerSessions = new Map();
-
-function equalSecret(left, right) {
-  const a = Buffer.from(String(left));
-  const b = Buffer.from(String(right));
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
 
 function playerCode(id) {
   return crypto.createHmac("sha256", roleSecret).update(`player:${id}`).digest("base64url");
 }
 
-function isJudge(req) {
+function getUserId(req) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  return Boolean(token && judgeSessions.has(token));
+  if (!token) return null;
+  return userSessions.get(token) || judgeSessions.get(token)?.userId || null;
 }
 
+function requireUser(req, res) {
+  const userId = getUserId(req);
+  if (!userId) {
+    sendJson(res, 401, { error: "Autenticazione richiesta." });
+    return null;
+  }
+  return userId;
+}
+
+function getRoomByCode(code) {
+  if (!code) return null;
+  return db.prepare("SELECT * FROM rooms WHERE UPPER(code) = UPPER(?)").get(code.trim());
+}
+
+function getRoomById(id) {
+  if (!id) return null;
+  return db.prepare("SELECT * FROM rooms WHERE id = ?").get(id);
+}
+
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function generateRoomCode() {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let code = "";
+    for (let i = 0; i < 5; i++) {
+      code += CODE_CHARS[crypto.randomInt(CODE_CHARS.length)];
+    }
+    const exists = db.prepare("SELECT 1 FROM rooms WHERE code = ?").get(code);
+    if (!exists) return code;
+  }
+  return crypto.randomBytes(3).toString("hex").toUpperCase().slice(0, 5);
+}
+
+function resolveRoom(req, url) {
+  // 1. /api/rooms/:code/...
+  const match = url.pathname.match(/^\/api\/rooms\/([^/]+)/);
+  if (match) {
+    const code = decodeURIComponent(match[1]);
+    const room = getRoomByCode(code);
+    if (room) return room;
+  }
+  // 2. Query param or header
+  const paramCode = url.searchParams.get("room") || req.headers["x-room-code"];
+  if (paramCode) {
+    const room = getRoomByCode(paramCode);
+    if (room) return room;
+  }
+  // 3. Active room in judge session
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (token && judgeSessions.has(token)) {
+    const activeId = judgeSessions.get(token).activeRoomId;
+    if (activeId) {
+      const room = getRoomById(activeId);
+      if (room) return room;
+    }
+  }
+  // 4. Fallback to default room
+  return getRoomById(defaultRoom.id);
+}
+
+function isJudge(req, room) {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (!token) return false;
+  const jSession = judgeSessions.get(token);
+  if (jSession) return true;
+  const uId = userSessions.get(token);
+  if (uId && (!room || room.owner_id === uId || room.id === defaultRoom.id)) return true;
+  return false;
+}
+
+function requireJudge(req, res, room) {
+  if (isJudge(req, room)) return true;
+  sendJson(res, 401, { error: "Accesso giudice richiesto per questa stanza." });
+  return false;
+}
+
+function logAction(roomId, actor, action, details = {}) {
+  try {
+    db.prepare(`INSERT INTO audit_log (room_id, actor, action, details, created_at) VALUES (?, ?, ?, ?, ?)`).run(
+      roomId, actor, action, typeof details === "string" ? details : JSON.stringify(details), new Date().toISOString()
+    );
+  } catch (err) {
+    console.error("Audit log error:", err);
+  }
+}
+
+// ----------------------------------------------------
+// HTTP PARSERS & UTILITIES
+// ----------------------------------------------------
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -256,81 +582,83 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getCounts() {
-  const counts = Object.fromEntries(getRoles().map((role) => [role.id, 0]));
-  const rows = db.prepare("SELECT role, COUNT(*) AS count FROM participants WHERE role IS NOT NULL GROUP BY role").all();
-  for (const row of rows) if (Object.hasOwn(counts, row.role)) counts[row.role] = row.count;
+// ----------------------------------------------------
+// ROOM STATE & GAME LOGIC
+// ----------------------------------------------------
+function getRoles(roomId) {
+  return db.prepare("SELECT * FROM game_roles WHERE room_id = ? ORDER BY id").all(roomId);
+}
+
+function getRoleNames(roomId) {
+  return Object.fromEntries(getRoles(roomId).map((r) => [r.id, r.name]));
+}
+
+function getRoleTargets(roomId) {
+  return Object.fromEntries(getRoles(roomId).map((r) => [r.id, r.target_count]));
+}
+
+function getCounts(roomId) {
+  const counts = Object.fromEntries(getRoles(roomId).map((r) => [r.id, 0]));
+  const rows = db.prepare("SELECT role, COUNT(*) AS count FROM participants WHERE room_id = ? AND role IS NOT NULL GROUP BY role").all(roomId);
+  for (const row of rows) {
+    if (Object.hasOwn(counts, row.role)) counts[row.role] = row.count;
+  }
   return counts;
 }
 
-function getRoleTargets() {
-  return Object.fromEntries(getRoles().map((role) => [role.id, role.target_count]));
-}
-
-function getRoles() {
-  return db.prepare("SELECT id, name, target_count, team, description, objectives, rules, actions FROM game_roles ORDER BY created_at, rowid").all();
-}
-
-function getRoleNames() {
-  return Object.fromEntries(getRoles().map((role) => [role.id, role.name]));
-}
-
-function getValidation() {
-  const participants = db.prepare("SELECT id, name, role FROM participants ORDER BY created_at, rowid").all();
-  const counts = getCounts();
-  const targets = getRoleTargets();
-  const roles = getRoles();
+function getValidation(roomId) {
+  const participants = db.prepare("SELECT id, name, role FROM participants WHERE room_id = ? ORDER BY name").all(roomId);
+  const targets = getRoleTargets(roomId);
+  const counts = getCounts(roomId);
+  const roleNames = getRoleNames(roomId);
   const issues = [];
-  if (participants.length === 0) issues.push("Aggiungi almeno un partecipante.");
-  const roleTotal = Object.values(targets).reduce((total, count) => total + count, 0);
-  if (roleTotal !== participants.length) {
-    issues.push(`Composizione ruoli: ${roleTotal} persone su ${participants.length} partecipanti. Le quantità dei ruoli devono coincidere con il totale dei presenti.`);
+  const targetTotal = Object.values(targets).reduce((sum, n) => sum + n, 0);
+
+  if (targetTotal !== participants.length) {
+    issues.push(`Composizione ruoli non valida: la somma dei ruoli configurati (${targetTotal}) deve coincidere con il numero di partecipanti presenti (${participants.length}).`);
   }
-  const missing = participants.filter((participant) => !participant.role).length;
-  if (missing) issues.push(`Assegnazioni mancanti: ${missing}.`);
-  for (const role of roles) {
-    if (counts[role.id] !== role.target_count) {
-      issues.push(`${role.name}: ${counts[role.id]}/${role.target_count}.`);
+  for (const [roleId, target] of Object.entries(targets)) {
+    const assigned = counts[roleId] || 0;
+    const name = roleNames[roleId] || roleId;
+    if (assigned !== target) {
+      issues.push(`Il ruolo ${name} richiede ${target} assegnazioni, ma attualmente ne ha ${assigned}.`);
     }
   }
-  const invalidAssignments = participants.filter((participant) => participant.role && !Object.hasOwn(targets, participant.role));
-  if (invalidAssignments.length) issues.push(`Assegnazioni a ruoli rimossi: ${invalidAssignments.length}.`);
-  const duplicates = db.prepare("SELECT LOWER(TRIM(name)) AS name, COUNT(*) AS count FROM participants GROUP BY LOWER(TRIM(name)) HAVING COUNT(*) > 1").all();
-  if (duplicates.length) issues.push(`Nomi duplicati: ${duplicates.map((item) => item.name).join(", ")}.`);
-  if (participants.some((participant) => !participant.name.trim())) issues.push("Ci sono partecipanti senza nome.");
-  return { participants, counts, targets, roles, issues, ready: issues.length === 0 };
-}
-
-function logAction(actor, action, details = {}) {
-  db.prepare("INSERT INTO audit_log (actor, action, details, created_at) VALUES (?, ?, ?, ?)")
-    .run(actor, action, JSON.stringify(details), new Date().toISOString());
-}
-
-function gameState() {
-  return db.prepare("SELECT * FROM game WHERE id = 1").get();
-}
-
-function ensureGameRunning(res) {
-  const game = gameState();
-  if (game.status !== "running" && game.status !== "paused") {
-    sendJson(res, 409, { error: "La partita non è in corso." });
-    return null;
+  const unassigned = participants.filter((p) => !p.role);
+  if (unassigned.length > 0) {
+    issues.push(`Assegnazioni mancanti: ci sono ${unassigned.length} partecipanti senza ruolo assegnato.`);
   }
-  return game;
+  for (const participant of participants) {
+    if (!participant.role) {
+      issues.push(`${participant.name} non ha ancora un ruolo assegnato.`);
+    }
+  }
+  return {
+    participants,
+    targets,
+    counts,
+    issues,
+    ready: issues.length === 0,
+    roles: getRoles(roomId),
+  };
 }
 
-function personalScore(participantId) {
-  return db.prepare("SELECT COALESCE(SUM(points), 0) AS score FROM score_ledger WHERE participant_id = ?").get(participantId).score;
+function personalScore(participantId, roomId) {
+  return db.prepare("SELECT COALESCE(SUM(points), 0) AS score FROM score_ledger WHERE participant_id = ? AND room_id = ?").get(participantId, roomId).score;
 }
 
-function finalGameSummary() {
-  const settings = JSON.parse(gameState().settings || "{}");
+function finalGameSummary(roomId) {
+  const room = getRoomById(roomId);
+  if (!room) return null;
+  const settings = JSON.parse(room.settings || "{}");
   const winMetric = ["score", "missions", "votes"].includes(settings.winMetric) ? settings.winMetric : "score";
   const players = db.prepare(`SELECT p.id, p.name, r.name AS role, r.team,
-    COALESCE((SELECT SUM(points) FROM score_ledger s WHERE s.participant_id = p.id), 0) AS score,
-    (SELECT COUNT(*) FROM missions m WHERE m.participant_id = p.id AND m.status = 'completed') AS completed_missions,
-    (SELECT COUNT(*) FROM votes v WHERE v.target_id = p.id) AS votes_received
-    FROM participants p LEFT JOIN game_roles r ON r.id = p.role ORDER BY p.name`).all();
+    COALESCE((SELECT SUM(points) FROM score_ledger s WHERE s.participant_id = p.id AND s.room_id = ?), 0) AS score,
+    (SELECT COUNT(*) FROM missions m WHERE m.participant_id = p.id AND m.room_id = ? AND m.status = 'completed') AS completed_missions,
+    (SELECT COUNT(*) FROM votes v WHERE v.target_id = p.id AND v.room_id = ?) AS votes_received
+    FROM participants p LEFT JOIN game_roles r ON (r.id = p.role AND r.room_id = p.room_id)
+    WHERE p.room_id = ? ORDER BY p.name`).all(roomId, roomId, roomId, roomId);
+  
   const teams = new Map();
   for (const player of players) {
     const team = player.team || player.role || "Senza squadra";
@@ -344,7 +672,7 @@ function finalGameSummary() {
   const metricField = { score: "score", missions: "completedMissions", votes: "votes" }[winMetric];
   const rankedTeams = [...teams.values()].sort((a, b) => b[metricField] - a[metricField] || a.team.localeCompare(b.team, "it"));
   const leaders = rankedTeams.length
-    ? rankedTeams.filter((team) => team[metricField] === rankedTeams[0][metricField]).map((team) => team.team)
+    ? rankedTeams.filter((t) => t[metricField] === rankedTeams[0][metricField]).map((t) => t.team)
     : [];
   return {
     winMetric,
@@ -352,254 +680,686 @@ function finalGameSummary() {
     winningTeams: leaders,
     players: [...players].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, "it")),
     totalParticipants: players.length,
-    totalVotes: db.prepare("SELECT COUNT(*) AS count FROM votes").get().count,
-    completedMissions: db.prepare("SELECT COUNT(*) AS count FROM missions WHERE status = 'completed'").get().count,
+    totalVotes: db.prepare("SELECT COUNT(*) AS count FROM votes WHERE room_id = ?").get(roomId).count,
+    completedMissions: db.prepare("SELECT COUNT(*) AS count FROM missions WHERE room_id = ? AND status = 'completed'").get(roomId).count,
   };
 }
 
-function applyDeadlineFailures(game) {
-  if (game.status !== "running" || !game.turn_started_at) return;
-  const settings = JSON.parse(game.settings || "{}");
+function applyDeadlineFailures(room) {
+  if (!room || room.status !== "running" || !room.turn_started_at) return;
+  const settings = JSON.parse(room.settings || "{}");
   if (settings.deadlineFailure !== true) return;
   const duration = (settings.turnDurationMinutes || 30) * 60000;
-  if (Date.now() - new Date(game.turn_started_at).getTime() < duration) return;
+  if (Date.now() - new Date(room.turn_started_at).getTime() < duration) return;
   const expired = db.prepare(`SELECT id, participant_id, title FROM missions
-    WHERE turn_number = ? AND status IN ('assigned', 'active')`).all(game.current_turn);
+    WHERE room_id = ? AND turn_number = ? AND status IN ('assigned', 'active')`).all(room.id, room.current_turn);
   if (!expired.length) return;
   const now = new Date().toISOString();
   const failMission = db.prepare(`UPDATE missions SET status = 'rejected',
     review_note = 'Missione non completata entro la scadenza configurata.', reviewed_at = ?
-    WHERE id = ? AND status IN ('assigned', 'active')`);
+    WHERE id = ? AND status IN ('assigned', 'active') AND room_id = ?`);
   for (const mission of expired) {
-    const result = failMission.run(now, mission.id);
-    if (result.changes) logAction("system", "mission_deadline_failed", { missionId: mission.id, participantId: mission.participant_id });
+    const result = failMission.run(now, mission.id, room.id);
+    if (result.changes) logAction(room.id, "system", "mission_deadline_failed", { missionId: mission.id, participantId: mission.participant_id });
   }
 }
-function requireJudge(req, res) {
-  if (isJudge(req)) return true;
-  sendJson(res, 401, { error: "Accesso giudice richiesto." });
-  return false;
+
+function logAction(roomId, actor, action, details = {}) {
+  db.prepare("INSERT INTO audit_log (room_id, actor, action, details, created_at) VALUES (?, ?, ?, ?, ?)").run(
+    roomId, actor, action, typeof details === "string" ? details : JSON.stringify(details), new Date().toISOString()
+  );
 }
 
-function getPlayerId(req) {
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  return token ? playerSessions.get(token) : undefined;
+function autoBalanceRoles(roomId) {
+  const pCount = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ?").get(roomId).count;
+  const roles = db.prepare("SELECT id, name FROM game_roles WHERE room_id = ? ORDER BY id").all(roomId);
+  let sabotatori = 0;
+  let sentinelle = 0;
+  let veggente = 0;
+  let malcapitati = 0;
+
+  if (pCount <= 2) {
+    sabotatori = Math.min(pCount, 1);
+    sentinelle = Math.max(0, pCount - sabotatori);
+  } else if (pCount === 3) {
+    sabotatori = 1;
+    sentinelle = 1;
+    veggente = 1;
+  } else {
+    veggente = roles.some((r) => r.id === "veggente") ? 1 : 0;
+    sabotatori = Math.max(1, Math.round(pCount * 0.18));
+    sentinelle = Math.max(1, Math.round(pCount * 0.20));
+    malcapitati = Math.max(0, pCount - (sabotatori + sentinelle + veggente));
+  }
+
+  const updates = {
+    sentinella: sentinelle,
+    sabotatore: sabotatori,
+    veggente: veggente,
+    malcapitato: malcapitati,
+  };
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const updateTarget = db.prepare("UPDATE game_roles SET target_count = ? WHERE room_id = ? AND id = ?");
+    for (const [roleId, count] of Object.entries(updates)) {
+      updateTarget.run(count, roomId, roleId);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return updates;
 }
 
+function shuffleRolesForRoom(roomId) {
+  const participants = db.prepare("SELECT id, name FROM participants WHERE room_id = ? ORDER BY name").all(roomId);
+  if (participants.length === 0) {
+    throw new Error("Nessun partecipante nella stanza per eseguire il sorteggio.");
+  }
+  const roles = db.prepare("SELECT id, name, target_count FROM game_roles WHERE room_id = ?").all(roomId);
+  const pool = [];
+  for (const r of roles) {
+    for (let i = 0; i < r.target_count; i++) pool.push(r.id);
+  }
+
+  if (pool.length < participants.length) {
+    const diff = participants.length - pool.length;
+    const defaultRole = roles.find((r) => r.id === "malcapitato")?.id || roles[0]?.id;
+    for (let i = 0; i < diff; i++) pool.push(defaultRole);
+  } else if (pool.length > participants.length) {
+    pool.length = participants.length;
+  }
+
+  // Modern Fisher-Yates shuffle
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const updateRole = db.prepare("UPDATE participants SET role = ? WHERE id = ? AND room_id = ?");
+    for (let i = 0; i < participants.length; i++) {
+      updateRole.run(pool[i], participants[i].id, roomId);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return participants.map((p, i) => ({ id: p.id, name: p.name, role: pool[i] }));
+}
+
+function randomBatchMissions(roomId, currentTurn) {
+  const participants = db.prepare("SELECT id, name FROM participants WHERE room_id = ?").all(roomId);
+  if (participants.length === 0) throw new Error("Nessun partecipante a cui assegnare missioni.");
+
+  const templates = [...HALLOWEEN_MISSION_TEMPLATES];
+  for (let i = templates.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [templates[i], templates[j]] = [templates[j], templates[i]];
+  }
+
+  const insert = db.prepare(`INSERT INTO missions
+    (id, room_id, title, description, objective, rules, verification, score, turn_number, participant_id, status, proof, review_note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'assigned', '', '', ?)`);
+
+  let count = 0;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (let i = 0; i < participants.length; i++) {
+      const template = templates[i % templates.length];
+      insert.run(
+        crypto.randomUUID(), roomId, template.title, template.description,
+        template.objective, template.rules, template.verification, template.score,
+        currentTurn, participants[i].id, new Date().toISOString()
+      );
+      count++;
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return count;
+}
+
+function getLanAddresses() {
+  const interfaces = os.networkInterfaces();
+  return Object.values(interfaces).flat().filter((item) => item && item.family === "IPv4" && !item.internal).map((item) => item.address);
+}
+
+// ----------------------------------------------------
+// MAIN SERVER ROUTER
+// ----------------------------------------------------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  const route = `${req.method} ${url.pathname}`;
+  let route = `${req.method} ${url.pathname}`;
+
   try {
+    // --------------------------------------------------
+    // PUBLIC / STATUS
+    // --------------------------------------------------
     if (route === "GET /api/status") {
-      const game = gameState();
-      return sendJson(res, 200, { started: Boolean(game.started_at), addresses: getLanAddresses(), port: PORT });
+      const room = resolveRoom(req, url);
+      return sendJson(res, 200, {
+        started: Boolean(room?.started_at),
+        roomCode: room?.code || "H4LL0",
+        addresses: getLanAddresses(),
+        port: PORT,
+      });
     }
 
-    if (route === "POST /api/judge/login") {
+    // --------------------------------------------------
+    // AUTHENTICATION (USERS / GAME MASTERS)
+    // --------------------------------------------------
+    if (route === "POST /api/auth/register") {
       const body = await readJson(req);
-      if (!equalSecret(body.password || "", judgePassword)) {
-        return sendJson(res, 401, { error: "Password giudice non corretta." });
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      if (!username || username.length < 3 || username.length > 30) {
+        return sendJson(res, 400, { error: "Lo username deve contenere tra 3 e 30 caratteri." });
+      }
+      if (!password || password.length < 6) {
+        return sendJson(res, 400, { error: "La password deve contenere almeno 6 caratteri." });
+      }
+      const existing = db.prepare("SELECT 1 FROM users WHERE username = ?").get(username);
+      if (existing) {
+        return sendJson(res, 409, { error: "Username già registrato. Scegline un altro." });
+      }
+      const userId = crypto.randomUUID();
+      const passwordHash = hashPassword(password);
+      db.prepare("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)").run(
+        userId, username, passwordHash, new Date().toISOString()
+      );
+      const token = crypto.randomBytes(32).toString("base64url");
+      userSessions.set(token, userId);
+      return sendJson(res, 201, { token, user: { id: userId, username } });
+    }
+
+    if (route === "POST /api/auth/login") {
+      const body = await readJson(req);
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
+      const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+      if (!user || !verifyPassword(password, user.password_hash)) {
+        return sendJson(res, 401, { error: "Username o password non corretti." });
       }
       const token = crypto.randomBytes(32).toString("base64url");
-      judgeSessions.add(token);
+      userSessions.set(token, user.id);
+      return sendJson(res, 200, { token, user: { id: user.id, username: user.username } });
+    }
+
+    if (route === "GET /api/auth/me") {
+      const userId = getUserId(req);
+      if (!userId) return sendJson(res, 401, { error: "Non autenticato." });
+      const user = db.prepare("SELECT id, username, created_at FROM users WHERE id = ?").get(userId);
+      if (!user) return sendJson(res, 404, { error: "Utente non trovato." });
+      return sendJson(res, 200, { user });
+    }
+
+    if (route === "POST /api/auth/logout") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      if (token) {
+        userSessions.delete(token);
+        judgeSessions.delete(token);
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // Legacy Judge Login Support
+    if (route === "POST /api/judge/login") {
+      const body = await readJson(req);
+      const inputPass = String(body.password || "");
+      // Check default admin user or legacy password
+      const admin = db.prepare("SELECT * FROM users WHERE username = 'admin'").get();
+      const valid = (admin && verifyPassword(inputPass, admin.password_hash)) || inputPass === judgePassword;
+      if (!valid) return sendJson(res, 401, { error: "Password giudice non corretta." });
+      const token = crypto.randomBytes(32).toString("base64url");
+      judgeSessions.set(token, { userId: admin?.id || defaultUser.id, activeRoomId: defaultRoom.id });
       return sendJson(res, 200, { token });
     }
 
-    if (url.pathname.startsWith("/api/judge/")) {
-      if (!requireJudge(req, res)) return;
+    // --------------------------------------------------
+    // MULTI-ROOM MANAGEMENT
+    // --------------------------------------------------
+    if (route === "GET /api/rooms") {
+      const userId = requireUser(req, res);
+      if (!userId) return;
+      const rooms = db.prepare(`SELECT r.*,
+        (SELECT COUNT(*) FROM participants p WHERE p.room_id = r.id) AS participant_count
+        FROM rooms r WHERE r.owner_id = ? ORDER BY r.created_at DESC`).all(userId);
+      return sendJson(res, 200, { rooms });
+    }
 
-      if (route === "GET /api/judge/state") {
-        applyDeadlineFailures(gameState());
-        const state = getValidation();
-        const game = gameState();
-        const history = db.prepare("SELECT participant_name, old_role, new_role, reason, changed_at FROM role_history ORDER BY id DESC LIMIT 100").all();
-        const participants = state.participants.map((participant) => ({
-          ...participant,
-          accessCode: playerCode(participant.id),
-          score: personalScore(participant.id),
-          online: [...playerSessions.values()].includes(participant.id),
+    if (route === "POST /api/rooms") {
+      const userId = requireUser(req, res);
+      if (!userId) return;
+      const body = await readJson(req);
+      const name = String(body.name || "Nuova Stanza").trim().slice(0, 60);
+      const code = generateRoomCode();
+      const roomId = crypto.randomUUID();
+      db.prepare(`INSERT INTO rooms
+        (id, code, name, owner_id, status, settings, current_turn, roles_revealed, vote_open, vote_limit, created_at)
+        VALUES (?, ?, ?, ?, 'setup', '{}', 0, 0, 0, 1, ?)`).run(
+        roomId, code, name, userId, new Date().toISOString()
+      );
+      seedRoomRoles(roomId);
+      logAction(roomId, "judge", "room_created", { name, code });
+      return sendJson(res, 201, {
+        room: { id: roomId, code, name, status: "setup", created_at: new Date().toISOString() },
+      });
+    }
+
+    if (route.startsWith("GET /api/rooms/") && !route.includes("/judge") && !route.includes("/join")) {
+      const code = url.pathname.split("/")[3];
+      const room = getRoomByCode(code);
+      if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
+      const count = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ?").get(room.id).count;
+      return sendJson(res, 200, {
+        room: { id: room.id, code: room.code, name: room.name, status: room.status, participant_count: count },
+      });
+    }
+
+    if (route.startsWith("DELETE /api/rooms/")) {
+      const userId = requireUser(req, res);
+      if (!userId) return;
+      const code = url.pathname.split("/")[3];
+      const room = getRoomByCode(code);
+      if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
+      if (room.owner_id !== userId) return sendJson(res, 403, { error: "Non sei il proprietario di questa stanza." });
+      db.prepare("DELETE FROM rooms WHERE id = ?").run(room.id);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // --------------------------------------------------
+    // PLAYER JOIN (LOBBY WITH CODE + NICKNAME + PIN)
+    // --------------------------------------------------
+    if (route.match(/^POST \/api\/rooms\/[^/]+\/join$/) || route === "POST /api/player/join") {
+      const code = route.match(/^POST \/api\/rooms\/([^/]+)\/join$/)?.[1] || (await readJson(req)).roomCode;
+      const room = getRoomByCode(code);
+      if (!room) return sendJson(res, 404, { error: "Codice stanza inesistente. Verifica il codice a 5 lettere." });
+      const body = await readJson(req);
+      const name = String(body.name || "").trim();
+      const pin = body.pin ? String(body.pin).trim() : null;
+
+      if (!name || name.length > 60) {
+        return sendJson(res, 400, { error: "Inserisci un nome partecipante valido (1-60 caratteri)." });
+      }
+
+      // Check existing player by name in this room
+      const existing = db.prepare("SELECT * FROM participants WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(room.id, name);
+
+      let participantId;
+      if (existing) {
+        if (existing.pin && pin !== existing.pin) {
+          return sendJson(res, 401, { error: "Questo nome è già presente e il PIN inserito non è corretto." });
+        }
+        participantId = existing.id;
+      } else {
+        if (room.status !== "setup") {
+          return sendJson(res, 409, { error: "La partita è già iniziata e non accetta nuovi ingressi." });
+        }
+        participantId = crypto.randomUUID();
+        db.prepare("INSERT INTO participants (id, room_id, name, role, pin, created_at) VALUES (?, ?, ?, NULL, ?, ?)").run(
+          participantId, room.id, name, pin, new Date().toISOString()
+        );
+        logAction(room.id, "player", "player_joined", { name });
+      }
+
+      const token = crypto.randomBytes(32).toString("base64url");
+      playerSessions.set(token, { participantId, roomId: room.id });
+      return sendJson(res, 200, {
+        token,
+        participant: { id: participantId, name, role: existing?.role || null },
+        room: { code: room.code, name: room.name, status: room.status },
+      });
+    }
+
+    // Legacy player login with code
+    if (route === "POST /api/player/login") {
+      const body = await readJson(req);
+      const code = String(body.code || "").trim();
+      const allParticipants = db.prepare("SELECT id, room_id, name, role FROM participants").all();
+      const match = allParticipants.find((p) => playerCode(p.id) === code);
+      if (!match) return sendJson(res, 401, { error: "Codice giocatore non riconosciuto." });
+      const token = crypto.randomBytes(32).toString("base64url");
+      playerSessions.set(token, { participantId: match.id, roomId: match.room_id });
+      return sendJson(res, 200, { token });
+    }
+
+    if (route === "GET /api/player/me") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const { participantId, roomId } = session;
+      const room = getRoomById(roomId);
+      if (!room || !room.started_at) {
+        return sendJson(res, 409, { error: "La partita non è ancora iniziata." });
+      }
+      const participant = db.prepare("SELECT * FROM participants WHERE id = ? AND room_id = ?").get(participantId, roomId);
+      if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
+      const role = participant.role
+        ? db.prepare("SELECT name FROM game_roles WHERE id = ? AND room_id = ?").get(participant.role, roomId)
+        : null;
+      return sendJson(res, 200, {
+        name: participant.name,
+        role: role ? role.name : null,
+      });
+    }
+
+    // --------------------------------------------------
+    // PLAYER DASHBOARD & ACTIONS
+    // --------------------------------------------------
+    if (route === "GET /api/player/dashboard" || route.match(/^GET \/api\/rooms\/[^/]+\/player\/dashboard$/)) {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const { participantId, roomId } = session;
+      const room = getRoomById(roomId);
+      if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
+      const participant = db.prepare("SELECT * FROM participants WHERE id = ? AND room_id = ?").get(participantId, roomId);
+      if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
+
+      // Sala d'Attesa (Waiting Room) se la partita è ancora in preparazione
+      if (room.status === "setup" || !room.started_at) {
+        const allInRoom = db.prepare("SELECT id, name FROM participants WHERE room_id = ? ORDER BY name").all(roomId);
+        return sendJson(res, 200, {
+          waiting: true,
+          roomCode: room.code,
+          roomName: room.name,
+          participant: { id: participant.id, name: participant.name },
+          participantsCount: allInRoom.length,
+          players: allInRoom.map((p) => ({
+            id: p.id,
+            name: p.name,
+            online: [...playerSessions.values()].some((s) => s.participantId === p.id),
+          })),
+        });
+      }
+
+      applyDeadlineFailures(room);
+      const role = participant.role
+        ? db.prepare("SELECT * FROM game_roles WHERE id = ? AND room_id = ?").get(participant.role, roomId)
+        : null;
+
+      // Fix Alleati: Solo fazioni cospiratrici/operative vedono i compagni; mai Malcapitati o Veggente!
+      const isHiddenInnocent = !role || role.team === "Malcapitati" || role.id === "veggente";
+      const allies = !isHiddenInnocent
+        ? db.prepare("SELECT name FROM participants WHERE room_id = ? AND role = ? AND id != ? ORDER BY name")
+            .all(roomId, participant.role, participant.id)
+            .map((r) => r.name)
+        : [];
+
+      const missions = db.prepare("SELECT * FROM missions WHERE participant_id = ? AND room_id = ? ORDER BY created_at DESC").all(participant.id, roomId);
+      const messages = db.prepare(`SELECT m.* FROM messages m
+        WHERE m.room_id = ? AND (
+          m.participant_id = ? OR 
+          (m.sender = 'judge' AND m.participant_id IS NULL AND (m.team IS NULL OR m.team = ?))
+        ) ORDER BY m.created_at DESC LIMIT 50`).all(roomId, participant.id, role?.team || null);
+      const actions = db.prepare("SELECT * FROM secret_actions WHERE participant_id = ? AND room_id = ? ORDER BY created_at DESC").all(participant.id, roomId);
+      const settings = JSON.parse(room.settings || "{}");
+      const candidates = db.prepare("SELECT id, name FROM participants WHERE room_id = ? AND id != ? ORDER BY name").all(roomId, participant.id);
+      const myVotes = db.prepare("SELECT target_id FROM votes WHERE room_id = ? AND voter_id = ?").all(roomId, participant.id).map((v) => v.target_id);
+
+      const roleObj = role ? {
+        id: role.id,
+        name: role.name,
+        team: role.team,
+        description: role.description,
+        objectives: role.objectives,
+        rules: role.rules,
+        actions: role.actions ? role.actions.split("\n").filter(Boolean) : [],
+      } : null;
+
+      const gameObj = {
+        id: room.id,
+        code: room.code,
+        name: room.name,
+        status: room.status,
+        currentTurn: room.current_turn,
+        turnCount: settings.turnCount || 1,
+        turnStartedAt: room.turn_started_at,
+        pausedRemainingMs: room.paused_remaining_ms,
+        turnDurationMinutes: settings.turnDurationMinutes || 30,
+        rolesRevealed: Boolean(room.roles_revealed),
+        voteOpen: Boolean(room.vote_open),
+        voteLimit: room.vote_limit,
+        winMetric: settings.winMetric || "score",
+        rules: settings.rules || "",
+        winConditions: settings.winConditions || "",
+      };
+
+      return sendJson(res, 200, {
+        waiting: false,
+        game: gameObj,
+        room: gameObj,
+        participant: {
+          id: participant.id,
+          name: participant.name,
+          role: roleObj,
+          score: personalScore(participant.id, roomId),
+        },
+        role: roleObj,
+        score: personalScore(participant.id, roomId),
+        allies,
+        missions,
+        messages,
+        actions,
+        candidates,
+        myVotes,
+        summary: room.roles_revealed ? finalGameSummary(roomId) : null,
+        finalResults: room.roles_revealed ? finalGameSummary(roomId) : null,
+      });
+    }
+
+    if (route === "POST /api/player/messages") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const body = await readJson(req);
+      const messageText = String(body.body || "").trim();
+      const subject = String(body.subject || "").trim().slice(0, 100);
+      const kind = ["message", "report"].includes(body.kind) ? body.kind : "message";
+      if (!messageText) return sendJson(res, 400, { error: "Il messaggio non può essere vuoto." });
+      db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, status, created_at)
+        VALUES (?, ?, ?, 'player', ?, ?, ?, 'pending', ?)`).run(
+        crypto.randomUUID(), session.roomId, session.participantId, kind, subject, messageText, new Date().toISOString()
+      );
+      return sendJson(res, 201, { ok: true });
+    }
+
+    if (route === "POST /api/player/actions") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const body = await readJson(req);
+      const title = String(body.title || "").trim();
+      const details = String(body.details || "").trim();
+      if (!title) return sendJson(res, 400, { error: "Inserisci un titolo per l'azione segreta." });
+
+      const participant = db.prepare("SELECT role FROM participants WHERE id = ? AND room_id = ?").get(session.participantId, session.roomId);
+      if (participant?.role) {
+        const role = db.prepare("SELECT actions FROM game_roles WHERE id = ? AND room_id = ?").get(participant.role, session.roomId);
+        if (role && role.actions && role.actions.trim()) {
+          const allowed = role.actions.split("\n").map((a) => a.trim().toLowerCase()).filter(Boolean);
+          if (allowed.length > 0 && !allowed.includes(title.toLowerCase())) {
+            return sendJson(res, 403, { error: "Azione non consentita per il tuo ruolo." });
+          }
+        }
+      }
+
+      db.prepare(`INSERT INTO secret_actions (id, room_id, participant_id, title, details, status, score, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)`).run(
+        crypto.randomUUID(), session.roomId, session.participantId, title, details, new Date().toISOString()
+      );
+      return sendJson(res, 201, { ok: true });
+    }
+
+    if (route === "POST /api/player/vote") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const room = getRoomById(session.roomId);
+      if (!room || !room.vote_open) return sendJson(res, 409, { error: "Le votazioni sono attualmente chiuse." });
+      const alreadyVoted = db.prepare("SELECT 1 FROM votes WHERE room_id = ? AND voter_id = ?").get(session.roomId, session.participantId);
+      if (alreadyVoted) return sendJson(res, 409, { error: "Hai già espresso il tuo voto per questa sessione." });
+      const body = await readJson(req);
+      const targets = Array.isArray(body.targets) ? [...new Set(body.targets)] : [];
+      if (!targets.length) return sendJson(res, 400, { error: "Seleziona almeno un sospetto." });
+      if (targets.length > room.vote_limit) return sendJson(res, 400, { error: `Puoi votare al massimo ${room.vote_limit} sospetti.` });
+      if (targets.includes(session.participantId)) return sendJson(res, 400, { error: "Non puoi votare te stesso." });
+
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const insertVote = db.prepare("INSERT INTO votes (room_id, voter_id, target_id, created_at) VALUES (?, ?, ?, ?)");
+        const now = new Date().toISOString();
+        for (const targetId of targets) {
+          insertVote.run(session.roomId, session.participantId, targetId, now);
+        }
+        db.exec("COMMIT");
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+      return sendJson(res, 201, { ok: true });
+    }
+
+    if (route.startsWith("POST /api/player/missions/")) {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      const session = playerSessions.get(token);
+      if (!session) return sendJson(res, 401, { error: "Accesso giocatore richiesto." });
+      const parts = url.pathname.split("/");
+      const missionId = decodeURIComponent(parts[4]);
+      const action = parts[5];
+      const mission = db.prepare("SELECT * FROM missions WHERE id = ? AND participant_id = ? AND room_id = ?").get(missionId, session.participantId, session.roomId);
+      if (!mission) return sendJson(res, 404, { error: "Missione non trovata." });
+      const body = await readJson(req);
+
+      if (action === "start") {
+        db.prepare("UPDATE missions SET status = 'active' WHERE id = ? AND status = 'assigned'").run(missionId);
+      } else if (action === "submit") {
+        const proof = String(body.proof || "").trim();
+        if (!proof) return sendJson(res, 400, { error: "Inserisci una prova o descrizione del completamento." });
+        db.prepare("UPDATE missions SET status = 'submitted', proof = ?, submitted_at = ? WHERE id = ?").run(
+          proof, new Date().toISOString(), missionId
+        );
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (route === "POST /api/player/logout") {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      if (token) playerSessions.delete(token);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // --------------------------------------------------
+    // JUDGE / GAME MASTER ENDPOINTS (MULTI-ROOM SUPPORT)
+    // --------------------------------------------------
+    if (url.pathname.includes("/judge") || url.pathname.startsWith("/api/judge/")) {
+      const room = resolveRoom(req, url);
+      if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
+      if (!requireJudge(req, res, room)) return;
+
+      // Normalize route string so /api/rooms/:code/judge/... and /api/judge/... share code
+      let judgeAction = route;
+      if (route.includes("/judge")) {
+        const idx = route.indexOf("/judge");
+        judgeAction = `${req.method} /api/judge${route.slice(idx + 6)}`;
+      }
+
+      if (judgeAction === "GET /api/judge/state") {
+        applyDeadlineFailures(room);
+        const state = getValidation(room.id);
+        const history = db.prepare("SELECT participant_name, old_role, new_role, reason, changed_at FROM role_history WHERE room_id = ? ORDER BY id DESC LIMIT 100").all(room.id);
+        const participants = state.participants.map((p) => ({
+          ...p,
+          accessCode: playerCode(p.id),
+          score: personalScore(p.id, room.id),
+          online: [...playerSessions.values()].some((s) => s.participantId === p.id),
         }));
         const missions = db.prepare(`SELECT m.*, p.name AS participant_name
-          FROM missions m JOIN participants p ON p.id = m.participant_id ORDER BY m.created_at DESC`).all();
+          FROM missions m JOIN participants p ON p.id = m.participant_id
+          WHERE m.room_id = ? ORDER BY m.created_at DESC`).all(room.id);
         const messages = db.prepare(`SELECT m.*, p.name AS participant_name
           FROM messages m LEFT JOIN participants p ON p.id = m.participant_id
-          ORDER BY m.created_at DESC LIMIT 200`).all();
+          WHERE m.room_id = ? ORDER BY m.created_at DESC LIMIT 200`).all(room.id);
         const actions = db.prepare(`SELECT a.*, p.name AS participant_name
-          FROM secret_actions a JOIN participants p ON p.id = a.participant_id ORDER BY a.created_at DESC`).all();
-        const votes = game.vote_open ? [] : db.prepare(`SELECT v.target_id, COUNT(*) AS count, p.name
-          FROM votes v JOIN participants p ON p.id = v.target_id GROUP BY v.target_id ORDER BY count DESC, p.name`).all();
+          FROM secret_actions a JOIN participants p ON p.id = a.participant_id
+          WHERE a.room_id = ? ORDER BY a.created_at DESC`).all(room.id);
+        const votes = room.vote_open ? [] : db.prepare(`SELECT v.target_id, COUNT(*) AS count, p.name
+          FROM votes v JOIN participants p ON p.id = v.target_id
+          WHERE v.room_id = ? GROUP BY v.target_id ORDER BY count DESC, p.name`).all(room.id);
+
         return sendJson(res, 200, {
           ...state,
+          room: {
+            id: room.id,
+            code: room.code,
+            name: room.name,
+            status: room.status,
+            ownerId: room.owner_id,
+          },
           participants,
-          started: Boolean(game.started_at),
-          startedAt: game.started_at,
+          started: Boolean(room.started_at),
+          startedAt: room.started_at,
           history,
-          roles: getRoleNames(),
+          roles: getRoleNames(room.id),
           rolesDetailed: state.roles,
           limits: state.targets,
-          settings: JSON.parse(game.settings || "{}"),
+          settings: JSON.parse(room.settings || "{}"),
           game: {
-            status: game.status,
-            currentTurn: game.current_turn,
-            turnStartedAt: game.turn_started_at,
-            pausedRemainingMs: game.paused_remaining_ms,
-            rolesRevealed: Boolean(game.roles_revealed),
-            voteOpen: Boolean(game.vote_open),
-            voteLimit: game.vote_limit,
+            status: room.status,
+            currentTurn: room.current_turn,
+            turnStartedAt: room.turn_started_at,
+            pausedRemainingMs: room.paused_remaining_ms,
+            rolesRevealed: Boolean(room.roles_revealed),
+            voteOpen: Boolean(room.vote_open),
+            voteLimit: room.vote_limit,
           },
           missions,
           messages,
           actions,
           votes,
-          finalSummary: finalGameSummary(),
-          audit: db.prepare("SELECT actor, action, details, created_at FROM audit_log ORDER BY id DESC LIMIT 100").all(),
+          finalSummary: finalGameSummary(room.id),
+          audit: db.prepare("SELECT actor, action, details, created_at FROM audit_log WHERE room_id = ? ORDER BY id DESC LIMIT 100").all(room.id),
         });
       }
 
-      if (route === "PUT /api/judge/role-configuration") {
-        if (gameState().started_at) {
-          return sendJson(res, 409, { error: "La composizione dei ruoli non si può modificare dopo l'inizio." });
-        }
-        const body = await readJson(req);
-        const targets = body.targets;
-        const roleIds = getRoles().map((role) => role.id);
-        if (!targets || typeof targets !== "object" || Array.isArray(targets)
-          || roleIds.some((role) => !Object.hasOwn(targets, role))
-          || Object.keys(targets).some((role) => !roleIds.includes(role))) {
-          return sendJson(res, 400, { error: "Indica una quantità valida per ogni ruolo configurato." });
-        }
-        for (const role of roleIds) {
-          if (!Number.isSafeInteger(targets[role]) || targets[role] < 0) {
-            return sendJson(res, 400, { error: `La quantità di ${getRoleNames()[role]} deve essere un numero intero maggiore o uguale a zero.` });
-          }
-        }
-        const saveTarget = db.prepare("UPDATE game_roles SET target_count = ? WHERE id = ?");
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          for (const role of roleIds) saveTarget.run(targets[role], role);
-          for (const role of ROLE_KEYS) {
-            if (Object.hasOwn(targets, role)) {
-              db.prepare("UPDATE role_config SET target_count = ? WHERE role = ?").run(targets[role], role);
-            }
-          }
-          logAction("judge", "role_configuration_updated", targets);
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true, targets: getRoleTargets() });
+      // SMART AUTO-BALANCE
+      if (judgeAction === "POST /api/judge/auto-balance") {
+        if (room.started_at) return sendJson(res, 409, { error: "Non puoi ribilanciare i ruoli a partita già iniziata." });
+        const targets = autoBalanceRoles(room.id);
+        logAction(room.id, "judge", "roles_auto_balanced", targets);
+        return sendJson(res, 200, { ok: true, targets });
       }
 
-      if (route === "POST /api/judge/roles/clear") {
-        if (gameState().started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          db.prepare("UPDATE participants SET role = NULL").run();
-          const allRoles = db.prepare("SELECT id FROM game_roles").all();
-          const markRemoved = db.prepare("INSERT OR IGNORE INTO removed_roles (id) VALUES (?)");
-          for (const r of allRoles) markRemoved.run(r.id);
-          db.prepare("DELETE FROM game_roles").run();
-          logAction("judge", "all_roles_cleared");
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true });
+      // SMART SHUFFLE ROLES
+      if (judgeAction === "POST /api/judge/shuffle-roles") {
+        if (room.started_at) return sendJson(res, 409, { error: "Non puoi sorteggiare i ruoli a partita già iniziata." });
+        const assignments = shuffleRolesForRoom(room.id);
+        logAction(room.id, "judge", "roles_shuffled", { count: assignments.length });
+        return sendJson(res, 200, { ok: true, assignments });
       }
 
-      if (route === "POST /api/judge/roles/preset") {
-        if (gameState().started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          db.prepare("UPDATE participants SET role = NULL").run();
-          db.prepare("DELETE FROM game_roles").run();
-          for (const role of ROLE_KEYS) {
-            db.prepare("DELETE FROM removed_roles WHERE id = ?").run(role);
-            db.prepare(`INSERT INTO game_roles
-              (id, name, target_count, team, description, objectives, rules, actions, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-              .run(role, ROLE_NAMES[role], ROLE_LIMITS[role],
-                role === "sentinella" ? "Sentinelle" : role === "sabotatore" ? "Sabotatori" : "Malcapitati",
-                "", "", "", "", new Date().toISOString());
-          }
-          logAction("judge", "halloween_roles_preset_loaded");
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true });
+      // SMART MISSION TEMPLATES
+      if (judgeAction === "GET /api/judge/mission-templates") {
+        return sendJson(res, 200, { templates: HALLOWEEN_MISSION_TEMPLATES });
       }
 
-      if (route === "POST /api/judge/roles") {
-        if (gameState().started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        const body = await readJson(req);
-        const name = String(body.name || "").trim();
-        if (!name || name.length > 60) return sendJson(res, 400, { error: "Il nome del ruolo deve contenere da 1 a 60 caratteri." });
-        if (db.prepare("SELECT 1 FROM game_roles WHERE name = ? COLLATE NOCASE").get(name)) {
-          return sendJson(res, 409, { error: "Esiste già un ruolo con questo nome." });
-        }
-        const count = Number.isSafeInteger(Number(body.target_count)) && Number(body.target_count) >= 0
-          ? Number(body.target_count)
-          : (Number.isSafeInteger(Number(body.targetCount)) && Number(body.targetCount) >= 0 ? Number(body.targetCount) : 1);
-        const id = crypto.randomUUID();
-        db.prepare(`INSERT INTO game_roles
-          (id, name, target_count, team, description, objectives, rules, actions, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(id, name, count, String(body.team || "").trim(), String(body.description || "").trim(),
-            String(body.objectives || "").trim(), String(body.rules || "").trim(),
-            String(body.actions || "").trim(), new Date().toISOString());
-        logAction("judge", "role_created", { id, name, target_count: count });
-        return sendJson(res, 201, { id });
+      // SMART RANDOM BATCH MISSIONS
+      if (judgeAction === "POST /api/judge/missions/random-batch") {
+        const assigned = randomBatchMissions(room.id, room.current_turn || 1);
+        logAction(room.id, "judge", "missions_batch_assigned", { count: assigned });
+        return sendJson(res, 200, { ok: true, assignedCount: assigned });
       }
 
-      if (route.startsWith("PATCH /api/judge/roles/")) {
-        if (gameState().started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        const id = decodeURIComponent(url.pathname.split("/").pop());
-        const role = db.prepare("SELECT * FROM game_roles WHERE id = ?").get(id);
-        if (!role) return sendJson(res, 404, { error: "Ruolo non trovato." });
-        const body = await readJson(req);
-        const fields = ["name", "team", "description", "objectives", "rules", "actions"];
-        const next = Object.fromEntries(fields.map((field) => [field,
-          body[field] === undefined ? role[field] : String(body[field]).trim()]));
-        if (!next.name || next.name.length > 60) return sendJson(res, 400, { error: "Il nome del ruolo deve contenere da 1 a 60 caratteri." });
-        if (db.prepare("SELECT 1 FROM game_roles WHERE name = ? COLLATE NOCASE AND id != ?").get(next.name, id)) {
-          return sendJson(res, 409, { error: "Esiste già un ruolo con questo nome." });
-        }
-        const targetCount = body.target_count !== undefined && Number.isSafeInteger(Number(body.target_count)) && Number(body.target_count) >= 0
-          ? Number(body.target_count)
-          : (body.targetCount !== undefined && Number.isSafeInteger(Number(body.targetCount)) && Number(body.targetCount) >= 0 ? Number(body.targetCount) : role.target_count);
-        db.prepare(`UPDATE game_roles SET name = ?, target_count = ?, team = ?, description = ?, objectives = ?, rules = ?, actions = ? WHERE id = ?`)
-          .run(next.name, targetCount, next.team, next.description, next.objectives, next.rules, next.actions, id);
-        logAction("judge", "role_updated", { id, name: next.name, target_count: targetCount });
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route.startsWith("DELETE /api/judge/roles/")) {
-        if (gameState().started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        const id = decodeURIComponent(url.pathname.split("/").pop());
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          db.prepare("UPDATE participants SET role = NULL WHERE role = ?").run(id);
-          const result = db.prepare("DELETE FROM game_roles WHERE id = ?").run(id);
-          if (!result.changes) {
-            db.exec("ROLLBACK");
-            return sendJson(res, 404, { error: "Ruolo non trovato." });
-          }
-          db.prepare("INSERT OR IGNORE INTO removed_roles (id) VALUES (?)").run(id);
-          logAction("judge", "role_deleted", { id });
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route === "PUT /api/judge/settings") {
-        if (gameState().started_at) return sendJson(res, 409, { error: "Le regole di base non si possono modificare dopo l'inizio." });
+      // SETTINGS
+      if (judgeAction === "PUT /api/judge/settings") {
+        if (room.started_at) return sendJson(res, 409, { error: "Le regole di base non si possono modificare dopo l'inizio." });
         const body = await readJson(req);
         const turnCount = body.turnCount;
         const turnDurationMinutes = body.turnDurationMinutes;
@@ -617,642 +1377,477 @@ const server = http.createServer(async (req, res) => {
           deadlineFailure: body.deadlineFailure === true,
           winMetric,
         };
-        db.prepare("UPDATE game SET settings = ?, vote_limit = ? WHERE id = 1")
-          .run(JSON.stringify(settings), voteLimit);
-        logAction("judge", "game_settings_updated", settings);
+        db.prepare("UPDATE rooms SET settings = ?, vote_limit = ? WHERE id = ?").run(JSON.stringify(settings), voteLimit, room.id);
+        logAction(room.id, "judge", "game_settings_updated", settings);
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/participants") {
-        if (db.prepare("SELECT started_at FROM game WHERE id = 1").get().started_at) {
-          return sendJson(res, 409, { error: "I partecipanti non si possono aggiungere dopo l'inizio." });
-        }
+      // PARTICIPANTS CRUD
+      if (judgeAction === "POST /api/judge/participants") {
+        if (room.started_at) return sendJson(res, 409, { error: "I partecipanti non si possono aggiungere dopo l'inizio." });
         const body = await readJson(req);
         const name = String(body.name || "").trim();
         if (!name || name.length > 60) return sendJson(res, 400, { error: "Inserisci un nome da 1 a 60 caratteri." });
-        const duplicate = db.prepare("SELECT 1 FROM participants WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))").get(name);
-        if (duplicate) return sendJson(res, 409, { error: "Questo nome è già presente nell'elenco." });
-        db.prepare("INSERT INTO participants (id, name, role, created_at) VALUES (?, ?, NULL, ?)").run(crypto.randomUUID(), name, new Date().toISOString());
+        const dup = db.prepare("SELECT 1 FROM participants WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(room.id, name);
+        if (dup) return sendJson(res, 409, { error: "Questo nome è già presente nell'elenco." });
+        db.prepare("INSERT INTO participants (id, room_id, name, role, created_at) VALUES (?, ?, ?, NULL, ?)").run(
+          crypto.randomUUID(), room.id, name, new Date().toISOString()
+        );
         return sendJson(res, 201, { ok: true });
       }
 
-      if (route.startsWith("PATCH /api/judge/participants/")) {
+      if (judgeAction.startsWith("PATCH /api/judge/participants/")) {
         const id = decodeURIComponent(url.pathname.split("/").pop());
-        const participant = db.prepare("SELECT id, name, role FROM participants WHERE id = ?").get(id);
+        const participant = db.prepare("SELECT * FROM participants WHERE id = ? AND room_id = ?").get(id, room.id);
         if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
         const body = await readJson(req);
-        const game = db.prepare("SELECT started_at FROM game WHERE id = 1").get();
-        const newName = body.name === undefined ? participant.name : String(body.name).trim();
-        const newRole = body.role === undefined ? participant.role : body.role || null;
-        if (!newName || newName.length > 60) return sendJson(res, 400, { error: "Inserisci un nome da 1 a 60 caratteri." });
-        const availableRoles = getRoles();
-        const selectedRole = availableRoles.find((role) => role.id === newRole);
-        if (newRole !== null && !selectedRole) return sendJson(res, 400, { error: "Ruolo non valido." });
-        if (game.started_at && body.name !== undefined) return sendJson(res, 409, { error: "I nomi non si possono modificare dopo l'inizio." });
-        const duplicate = db.prepare("SELECT 1 FROM participants WHERE id != ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(id, newName);
-        if (duplicate) return sendJson(res, 409, { error: "Questo nome è già presente nell'elenco." });
-        if (newRole !== participant.role && game.started_at && !String(body.reason || "").trim()) {
+        const newName = body.name ? String(body.name).trim() : participant.name;
+        const newRole = body.role !== undefined ? (body.role || null) : participant.role;
+        const selectedRole = newRole ? db.prepare("SELECT * FROM game_roles WHERE id = ? AND room_id = ?").get(newRole, room.id) : null;
+        if (newRole && !selectedRole) return sendJson(res, 400, { error: "Ruolo selezionato non valido." });
+
+        if (room.started_at && !String(body.reason || "").trim()) {
           return sendJson(res, 400, { error: "Per una modifica eccezionale dopo l'inizio, inserisci il motivo." });
         }
         if (newRole !== null && newRole !== participant.role) {
-          const current = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE role = ?").get(newRole).count;
+          const current = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ? AND role = ?").get(room.id, newRole).count;
           if (current >= selectedRole.target_count) return sendJson(res, 409, { error: `Quantità prevista raggiunta per ${selectedRole.name}.` });
         }
-        const update = db.prepare("UPDATE participants SET name = ?, role = ? WHERE id = ?");
-        const logChange = db.prepare("INSERT INTO role_history (participant_id, participant_name, old_role, new_role, reason, changed_at) VALUES (?, ?, ?, ?, ?, ?)");
         db.exec("BEGIN IMMEDIATE");
         try {
-          update.run(newName, newRole, id);
+          db.prepare("UPDATE participants SET name = ?, role = ? WHERE id = ? AND room_id = ?").run(newName, newRole, id, room.id);
           if (newRole !== participant.role) {
-            logChange.run(id, newName, participant.role, newRole, game.started_at ? String(body.reason).trim() : "Assegnazione del giudice prima dell'inizio", new Date().toISOString());
+            db.prepare(`INSERT INTO role_history (room_id, participant_id, participant_name, old_role, new_role, reason, changed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+              room.id, id, newName, participant.role, newRole,
+              room.started_at ? String(body.reason).trim() : "Assegnazione manuale prima dell'inizio",
+              new Date().toISOString()
+            );
           }
           db.exec("COMMIT");
-        } catch (error) {
+        } catch (err) {
           db.exec("ROLLBACK");
-          throw error;
+          throw err;
         }
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "DELETE /api/judge/participants/all" || route === "POST /api/judge/participants/clear") {
-        const game = gameState();
-        const queryParams = new URL(req.url, `http://${req.headers.host || "localhost"}`).searchParams;
-        const force = queryParams.get("force") === "true";
-        if (game.status === "running" && game.current_turn > 0 && !force) {
+      if (judgeAction === "DELETE /api/judge/participants/all" || judgeAction === "POST /api/judge/participants/clear") {
+        const force = url.searchParams.get("force") === "true";
+        if (room.status === "running" && room.current_turn > 0 && !force) {
           return sendJson(res, 409, { error: "La partita è già in corso con turni attivi. Usa 'Nuova Partita' per azzerarla." });
         }
         db.exec("BEGIN IMMEDIATE");
         try {
-          db.prepare("UPDATE game SET started_at = NULL, status = 'setup', current_turn = 0, turn_started_at = NULL, paused_remaining_ms = NULL WHERE id = 1").run();
-          db.prepare("DELETE FROM messages WHERE participant_id IS NOT NULL").run();
-          db.prepare("DELETE FROM missions").run();
-          db.prepare("DELETE FROM secret_actions").run();
-          db.prepare("DELETE FROM votes").run();
-          db.prepare("DELETE FROM score_ledger").run();
-          db.prepare("DELETE FROM role_history").run();
-          db.prepare("DELETE FROM participants").run();
-          logAction("judge", "all_participants_cleared");
+          db.prepare("DELETE FROM messages WHERE room_id = ? AND participant_id IS NOT NULL").run(room.id);
+          db.prepare("DELETE FROM missions WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM secret_actions WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM votes WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM score_ledger WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM role_history WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM participants WHERE room_id = ?").run(room.id);
+          logAction(room.id, "judge", "all_participants_cleared");
           db.exec("COMMIT");
-        } catch (error) {
+        } catch (err) {
           db.exec("ROLLBACK");
-          throw error;
+          throw err;
         }
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route.startsWith("DELETE /api/judge/participants/")) {
-        const game = gameState();
-        const queryParams = new URL(req.url, `http://${req.headers.host || "localhost"}`).searchParams;
-        const force = queryParams.get("force") === "true";
-        if (game.status === "running" && game.current_turn > 0 && !force) {
+      if (judgeAction.startsWith("DELETE /api/judge/participants/")) {
+        const force = url.searchParams.get("force") === "true";
+        if (room.status === "running" && room.current_turn > 0 && !force) {
           return sendJson(res, 409, { error: "I partecipanti non si possono rimuovere durante un turno in corso." });
         }
         const id = decodeURIComponent(url.pathname.split("/").pop());
         db.exec("BEGIN IMMEDIATE");
         try {
-          db.prepare("DELETE FROM messages WHERE participant_id = ?").run(id);
-          db.prepare("DELETE FROM missions WHERE participant_id = ?").run(id);
-          db.prepare("DELETE FROM secret_actions WHERE participant_id = ?").run(id);
-          db.prepare("DELETE FROM votes WHERE voter_id = ? OR target_id = ?").run(id, id);
-          db.prepare("DELETE FROM score_ledger WHERE participant_id = ?").run(id);
-          db.prepare("DELETE FROM role_history WHERE participant_id = ?").run(id);
-          const result = db.prepare("DELETE FROM participants WHERE id = ?").run(id);
+          db.prepare("DELETE FROM messages WHERE room_id = ? AND participant_id = ?").run(room.id, id);
+          db.prepare("DELETE FROM missions WHERE room_id = ? AND participant_id = ?").run(room.id, id);
+          db.prepare("DELETE FROM secret_actions WHERE room_id = ? AND participant_id = ?").run(room.id, id);
+          db.prepare("DELETE FROM votes WHERE room_id = ? AND (voter_id = ? OR target_id = ?)").run(room.id, id, id);
+          db.prepare("DELETE FROM score_ledger WHERE room_id = ? AND participant_id = ?").run(room.id, id);
+          db.prepare("DELETE FROM role_history WHERE room_id = ? AND participant_id = ?").run(room.id, id);
+          const result = db.prepare("DELETE FROM participants WHERE id = ? AND room_id = ?").run(id, room.id);
           if (!result.changes) {
             db.exec("ROLLBACK");
             return sendJson(res, 404, { error: "Partecipante non trovato." });
           }
           db.exec("COMMIT");
-        } catch (error) {
+        } catch (err) {
           db.exec("ROLLBACK");
-          throw error;
+          throw err;
         }
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/start") {
+      // ROLES CRUD
+      if (judgeAction === "PUT /api/judge/role-configuration") {
+        if (room.started_at) return sendJson(res, 409, { error: "La composizione dei ruoli non si può modificare dopo l'inizio." });
         const body = await readJson(req);
-        if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
-        const state = getValidation();
-        if (!state.ready) return sendJson(res, 409, { error: "La configurazione non è valida.", issues: state.issues });
-        const now = new Date().toISOString();
-        const result = db.prepare(`UPDATE game SET started_at = ?, status = 'running', current_turn = 1,
-          turn_started_at = ? WHERE id = 1 AND started_at IS NULL AND status = 'setup'`).run(now, now);
-        if (!result.changes) return sendJson(res, 409, { error: "La partita è già iniziata." });
-        logAction("judge", "game_started", { participants: state.participants.length });
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route === "POST /api/judge/game/reset") {
-        const body = await readJson(req);
-        if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
+        const targets = body.targets;
+        const roleIds = getRoles(room.id).map((r) => r.id);
+        if (!targets || typeof targets !== "object" || Array.isArray(targets)
+          || roleIds.some((r) => !Object.hasOwn(targets, r))
+          || Object.values(targets).some((n) => !Number.isSafeInteger(n) || n < 0)) {
+          return sendJson(res, 400, { error: "Indica una quantità valida per ogni ruolo configurato." });
+        }
+        const saveTarget = db.prepare("UPDATE game_roles SET target_count = ? WHERE room_id = ? AND id = ?");
         db.exec("BEGIN IMMEDIATE");
         try {
-          db.prepare(`UPDATE game SET started_at = NULL, status = 'setup', current_turn = 0,
-            turn_started_at = NULL, paused_remaining_ms = NULL, roles_revealed = 0, vote_open = 0 WHERE id = 1`).run();
-          db.prepare("DELETE FROM messages").run();
-          db.prepare("DELETE FROM missions").run();
-          db.prepare("DELETE FROM secret_actions").run();
-          db.prepare("DELETE FROM votes").run();
-          db.prepare("DELETE FROM score_ledger").run();
-          db.prepare("DELETE FROM role_history").run();
-          if (body.clearParticipants === true) {
-            db.prepare("DELETE FROM participants").run();
-          } else {
-            db.prepare("UPDATE participants SET role = NULL").run();
-          }
-          if (body.clearRoles === true) {
-            const allRoles = db.prepare("SELECT id FROM game_roles").all();
-            const markRemoved = db.prepare("INSERT OR IGNORE INTO removed_roles (id) VALUES (?)");
-            for (const r of allRoles) markRemoved.run(r.id);
-            db.prepare("DELETE FROM game_roles").run();
-          }
-          logAction("judge", "game_reset", { clearParticipants: Boolean(body.clearParticipants), clearRoles: Boolean(body.clearRoles) });
+          for (const role of roleIds) saveTarget.run(Number(targets[role]) || 0, room.id, role);
+          logAction(room.id, "judge", "role_configuration_updated", targets);
           db.exec("COMMIT");
-        } catch (error) {
+        } catch (err) {
           db.exec("ROLLBACK");
-          throw error;
+          throw err;
+        }
+        return sendJson(res, 200, { ok: true, targets: getRoleTargets(room.id) });
+      }
+
+      if (judgeAction === "POST /api/judge/roles") {
+        if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
+        const body = await readJson(req);
+        const name = String(body.name || "").trim();
+        if (!name) return sendJson(res, 400, { error: "Il nome del ruolo è obbligatorio." });
+        const exists = db.prepare("SELECT 1 FROM game_roles WHERE room_id = ? AND LOWER(name) = LOWER(?)").get(room.id, name);
+        if (exists) return sendJson(res, 409, { error: "Un ruolo con questo nome esiste già nella stanza." });
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || crypto.randomUUID();
+        const targetCount = Number(body.target_count || body.targetCount || 0);
+        db.prepare(`INSERT INTO game_roles
+          (id, room_id, name, target_count, team, description, objectives, rules, actions, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          id, room.id, name, targetCount,
+          String(body.team || "").trim(),
+          String(body.description || "").trim(),
+          String(body.objectives || "").trim(),
+          String(body.rules || "").trim(),
+          String(body.actions || "").trim(),
+          new Date().toISOString()
+        );
+        logAction(room.id, "judge", "role_created", { id, name });
+        return sendJson(res, 201, { id, name });
+      }
+
+      if (judgeAction.startsWith("PATCH /api/judge/roles/")) {
+        if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
+        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const role = db.prepare("SELECT * FROM game_roles WHERE id = ? AND room_id = ?").get(id, room.id);
+        if (!role) return sendJson(res, 404, { error: "Ruolo non trovato." });
+        const body = await readJson(req);
+        const name = body.name !== undefined ? String(body.name).trim() : role.name;
+        const targetCount = body.target_count !== undefined ? Number(body.target_count) : role.target_count;
+        db.prepare(`UPDATE game_roles SET name = ?, target_count = ?, team = ?, description = ?, objectives = ?, rules = ?, actions = ?
+          WHERE id = ? AND room_id = ?`).run(
+          name, targetCount,
+          body.team !== undefined ? String(body.team).trim() : role.team,
+          body.description !== undefined ? String(body.description).trim() : role.description,
+          body.objectives !== undefined ? String(body.objectives).trim() : role.objectives,
+          body.rules !== undefined ? String(body.rules).trim() : role.rules,
+          body.actions !== undefined ? String(body.actions).trim() : role.actions,
+          id, room.id
+        );
+        logAction(room.id, "judge", "role_updated", { id, name });
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (judgeAction.startsWith("DELETE /api/judge/roles/")) {
+        if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
+        const id = decodeURIComponent(url.pathname.split("/").pop());
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          db.prepare("UPDATE participants SET role = NULL WHERE role = ? AND room_id = ?").run(id, room.id);
+          const result = db.prepare("DELETE FROM game_roles WHERE id = ? AND room_id = ?").run(id, room.id);
+          if (!result.changes) {
+            db.exec("ROLLBACK");
+            return sendJson(res, 404, { error: "Ruolo non trovato." });
+          }
+          logAction(room.id, "judge", "role_deleted", { id });
+          db.exec("COMMIT");
+        } catch (err) {
+          db.exec("ROLLBACK");
+          throw err;
         }
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/game-action") {
+      if (judgeAction === "POST /api/judge/roles/clear") {
+        if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          db.prepare("UPDATE participants SET role = NULL WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM game_roles WHERE room_id = ?").run(room.id);
+          logAction(room.id, "judge", "all_roles_cleared");
+          db.exec("COMMIT");
+        } catch (err) {
+          db.exec("ROLLBACK");
+          throw err;
+        }
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (judgeAction === "POST /api/judge/roles/preset") {
+        if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          db.prepare("UPDATE participants SET role = NULL WHERE room_id = ?").run(room.id);
+          db.prepare("DELETE FROM game_roles WHERE room_id = ?").run(room.id);
+          seedRoomRoles(room.id);
+          logAction(room.id, "judge", "halloween_roles_preset_loaded");
+          db.exec("COMMIT");
+        } catch (err) {
+          db.exec("ROLLBACK");
+          throw err;
+        }
+        return sendJson(res, 200, { ok: true });
+      }
+
+      // START GAME
+      if (judgeAction === "POST /api/judge/start") {
         const body = await readJson(req);
-        const game = gameState();
+        if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
+        const state = getValidation(room.id);
+        if (!state.ready) return sendJson(res, 409, { error: "La configurazione non è valida.", issues: state.issues });
         const now = new Date().toISOString();
-        if (body.action === "pause" && game.status === "running") {
-          const settings = JSON.parse(game.settings || "{}");
+        const result = db.prepare(`UPDATE rooms SET started_at = ?, status = 'running', current_turn = 1,
+          turn_started_at = ? WHERE id = ? AND started_at IS NULL AND status = 'setup'`).run(now, now, room.id);
+        if (!result.changes) return sendJson(res, 409, { error: "La partita è già iniziata." });
+        logAction(room.id, "judge", "game_started", { participants: state.participants.length });
+        return sendJson(res, 200, { ok: true });
+      }
+
+      // GAME ACTIONS (pause, resume, next-turn, end, terminate, reset)
+      if (judgeAction === "POST /api/judge/game-action") {
+        const body = await readJson(req);
+        const now = new Date().toISOString();
+        if (body.action === "pause" && room.status === "running") {
+          const settings = JSON.parse(room.settings || "{}");
           const duration = (settings.turnDurationMinutes || 30) * 60000;
-          const remaining = Math.max(0, duration - (Date.now() - new Date(game.turn_started_at).getTime()));
-          db.prepare("UPDATE game SET status = 'paused', paused_remaining_ms = ? WHERE id = 1").run(remaining);
-        } else if (body.action === "resume" && game.status === "paused") {
-          const settings = JSON.parse(game.settings || "{}");
+          const remaining = Math.max(0, duration - (Date.now() - new Date(room.turn_started_at).getTime()));
+          db.prepare("UPDATE rooms SET status = 'paused', paused_remaining_ms = ? WHERE id = ?").run(remaining, room.id);
+        } else if (body.action === "resume" && room.status === "paused") {
+          const settings = JSON.parse(room.settings || "{}");
           const duration = (settings.turnDurationMinutes || 30) * 60000;
-          const remaining = game.paused_remaining_ms ?? duration;
-          db.prepare("UPDATE game SET status = 'running', turn_started_at = ?, paused_remaining_ms = NULL WHERE id = 1")
-            .run(new Date(Date.now() - (duration - remaining)).toISOString());
-        } else if (body.action === "next-turn" && (game.status === "running" || game.status === "paused")) {
-          const settings = JSON.parse(game.settings || "{}");
+          const remaining = room.paused_remaining_ms ?? duration;
+          db.prepare("UPDATE rooms SET status = 'running', turn_started_at = ?, paused_remaining_ms = NULL WHERE id = ?")
+            .run(new Date(Date.now() - (duration - remaining)).toISOString(), room.id);
+        } else if (body.action === "next-turn" && (room.status === "running" || room.status === "paused")) {
+          const settings = JSON.parse(room.settings || "{}");
           const maxTurns = settings.turnCount || 1;
-          if (game.current_turn >= maxTurns) return sendJson(res, 409, { error: "È già stato raggiunto l'ultimo turno." });
-          db.prepare("UPDATE game SET current_turn = current_turn + 1, turn_started_at = ?, paused_remaining_ms = NULL, status = 'running' WHERE id = 1").run(now);
-        } else if (body.action === "end" && (game.status === "running" || game.status === "paused")) {
+          if (room.current_turn >= maxTurns) return sendJson(res, 409, { error: "È già stato raggiunto l'ultimo turno." });
+          db.prepare("UPDATE rooms SET current_turn = current_turn + 1, turn_started_at = ?, paused_remaining_ms = NULL, status = 'running' WHERE id = ?").run(now, room.id);
+        } else if (body.action === "end" && (room.status === "running" || room.status === "paused")) {
           if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
-          db.prepare("UPDATE game SET status = 'completed', vote_open = 0, turn_started_at = NULL, paused_remaining_ms = NULL WHERE id = 1").run();
+          db.prepare("UPDATE rooms SET status = 'completed', vote_open = 0, turn_started_at = NULL, paused_remaining_ms = NULL WHERE id = ?").run(room.id);
+        } else if (body.action === "terminate") {
+          // Fix terminate action
+          if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
+          db.prepare("UPDATE rooms SET status = 'terminated', vote_open = 0, turn_started_at = NULL, paused_remaining_ms = NULL WHERE id = ?").run(room.id);
+          logAction(room.id, "judge", "game_terminated");
         } else if (body.action === "reset" || body.action === "new-game") {
           if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
           db.exec("BEGIN IMMEDIATE");
           try {
-            db.prepare(`UPDATE game SET started_at = NULL, status = 'setup', current_turn = 0,
-              turn_started_at = NULL, paused_remaining_ms = NULL, roles_revealed = 0, vote_open = 0 WHERE id = 1`).run();
-            db.prepare("DELETE FROM messages").run();
-            db.prepare("DELETE FROM missions").run();
-            db.prepare("DELETE FROM secret_actions").run();
-            db.prepare("DELETE FROM votes").run();
-            db.prepare("DELETE FROM score_ledger").run();
-            db.prepare("DELETE FROM role_history").run();
+            db.prepare(`UPDATE rooms SET started_at = NULL, status = 'setup', current_turn = 0,
+              turn_started_at = NULL, paused_remaining_ms = NULL, roles_revealed = 0, vote_open = 0 WHERE id = ?`).run(room.id);
+            db.prepare("DELETE FROM messages WHERE room_id = ?").run(room.id);
+            db.prepare("DELETE FROM missions WHERE room_id = ?").run(room.id);
+            db.prepare("DELETE FROM secret_actions WHERE room_id = ?").run(room.id);
+            db.prepare("DELETE FROM votes WHERE room_id = ?").run(room.id);
+            db.prepare("DELETE FROM score_ledger WHERE room_id = ?").run(room.id);
+            db.prepare("DELETE FROM role_history WHERE room_id = ?").run(room.id);
             if (body.clearParticipants === true) {
-              db.prepare("DELETE FROM participants").run();
+              db.prepare("DELETE FROM participants WHERE room_id = ?").run(room.id);
             } else {
-              db.prepare("UPDATE participants SET role = NULL").run();
+              db.prepare("UPDATE participants SET role = NULL WHERE room_id = ?").run(room.id);
             }
             if (body.clearRoles === true) {
-              const allRoles = db.prepare("SELECT id FROM game_roles").all();
-              const markRemoved = db.prepare("INSERT OR IGNORE INTO removed_roles (id) VALUES (?)");
-              for (const r of allRoles) markRemoved.run(r.id);
-              db.prepare("DELETE FROM game_roles").run();
+              db.prepare("DELETE FROM game_roles WHERE room_id = ?").run(room.id);
             }
-            logAction("judge", "game_reset", { clearParticipants: Boolean(body.clearParticipants), clearRoles: Boolean(body.clearRoles) });
+            logAction(room.id, "judge", "game_reset");
             db.exec("COMMIT");
-          } catch (error) {
+          } catch (err) {
             db.exec("ROLLBACK");
-            throw error;
+            throw err;
           }
-          return sendJson(res, 200, { ok: true });
         } else {
           return sendJson(res, 409, { error: "Azione non valida per lo stato attuale della partita." });
         }
-        logAction("judge", `game_${body.action}`, { turn: game.current_turn });
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/game/reset") {
+      if (judgeAction === "POST /api/judge/reveal") {
         const body = await readJson(req);
         if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          db.prepare(`UPDATE game SET started_at = NULL, status = 'setup', current_turn = 0,
-            turn_started_at = NULL, paused_remaining_ms = NULL, roles_revealed = 0, vote_open = 0 WHERE id = 1`).run();
-          db.prepare("DELETE FROM messages").run();
-          db.prepare("DELETE FROM missions").run();
-          db.prepare("DELETE FROM secret_actions").run();
-          db.prepare("DELETE FROM votes").run();
-          db.prepare("DELETE FROM score_ledger").run();
-          db.prepare("DELETE FROM role_history").run();
-          if (body.clearParticipants === true) {
-            db.prepare("DELETE FROM participants").run();
-          } else {
-            db.prepare("UPDATE participants SET role = NULL").run();
-          }
-          if (body.clearRoles === true) {
-            const allRoles = db.prepare("SELECT id FROM game_roles").all();
-            const markRemoved = db.prepare("INSERT OR IGNORE INTO removed_roles (id) VALUES (?)");
-            for (const r of allRoles) markRemoved.run(r.id);
-            db.prepare("DELETE FROM game_roles").run();
-          }
-          logAction("judge", "game_reset");
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true });
+        if (room.status !== "completed") return sendJson(res, 409, { error: "I ruoli possono essere rivelati solo al termine della partita." });
+        db.prepare("UPDATE rooms SET roles_revealed = 1 WHERE id = ?").run(room.id);
+        logAction(room.id, "judge", "roles_revealed");
+        return sendJson(res, 200, { ok: true, summary: finalGameSummary(room.id) });
       }
 
-      if (route === "POST /api/judge/reveal") {
-        if (gameState().status !== "completed") return sendJson(res, 409, { error: "Puoi rivelare i ruoli soltanto dopo aver concluso la partita." });
-        const body = await readJson(req);
-        if (body.confirmed !== true) return sendJson(res, 400, { error: "Conferma esplicita richiesta." });
-        db.prepare("UPDATE game SET roles_revealed = 1 WHERE id = 1").run();
-        logAction("judge", "roles_revealed");
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route === "POST /api/judge/missions") {
-        const game = ensureGameRunning(res);
-        if (!game) return;
+      if (judgeAction === "POST /api/judge/missions") {
         const body = await readJson(req);
         const title = String(body.title || "").trim();
-        if (Boolean(body.participantId) === Boolean(body.roleId)) {
-          return sendJson(res, 400, { error: "Seleziona un partecipante oppure un ruolo." });
-        }
-        let targets;
-        if (body.roleId) {
-          if (!db.prepare("SELECT 1 FROM game_roles WHERE id = ?").get(body.roleId)) {
-            return sendJson(res, 400, { error: "Ruolo non valido." });
+        const description = String(body.description || "").trim();
+        const score = Number(body.score || 0);
+        const turnNumber = Number(body.turn || room.current_turn || 1);
+        if (!title) return sendJson(res, 400, { error: "Il titolo della missione è obbligatorio." });
+
+        let assignedCount = 0;
+        let createdId = crypto.randomUUID();
+        const insert = db.prepare(`INSERT INTO missions
+          (id, room_id, title, description, objective, rules, verification, score, turn_number, participant_id, status, proof, review_note, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'assigned', '', '', ?)`);
+        const now = new Date().toISOString();
+
+        if (body.participantId) {
+          createdId = crypto.randomUUID();
+          insert.run(createdId, room.id, title, description, String(body.objective || "").trim(), String(body.rules || "").trim(), String(body.verification || "").trim(), score, turnNumber, body.participantId, now);
+          assignedCount = 1;
+        } else if (body.roleId) {
+          const targets = db.prepare("SELECT id FROM participants WHERE room_id = ? AND role = ?").all(room.id, body.roleId);
+          for (const t of targets) {
+            createdId = crypto.randomUUID();
+            insert.run(createdId, room.id, title, description, String(body.objective || "").trim(), String(body.rules || "").trim(), String(body.verification || "").trim(), score, turnNumber, t.id, now);
+            assignedCount++;
           }
-          targets = db.prepare("SELECT id FROM participants WHERE role = ?").all(body.roleId).map((row) => row.id);
-          if (!targets.length) return sendJson(res, 409, { error: "Nessun partecipante è assegnato a questo ruolo." });
-        } else {
-          const participant = db.prepare("SELECT id FROM participants WHERE id = ?").get(body.participantId);
-          if (!participant) return sendJson(res, 400, { error: "Seleziona un partecipante valido." });
-          targets = [participant.id];
         }
-        if (!title || title.length > 120) return sendJson(res, 400, { error: "Il titolo deve contenere da 1 a 120 caratteri." });
-        const score = body.score === undefined ? 0 : body.score;
-        const turn = body.turn === undefined ? game.current_turn : body.turn;
-        const settings = JSON.parse(game.settings || "{}");
-        if (!Number.isSafeInteger(score) || score < 0 || !Number.isSafeInteger(turn) || turn < 1) {
-          return sendJson(res, 400, { error: "Punteggio o turno non valido." });
-        }
-        if (turn > (settings.turnCount || 1)) return sendJson(res, 400, { error: "Il turno supera il numero configurato per la partita." });
-        const insertMission = db.prepare(`INSERT INTO missions
-          (id, title, description, objective, rules, verification, score, turn_number, participant_id, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-        const ids = [];
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          for (const participantId of targets) {
-            const id = crypto.randomUUID();
-            insertMission.run(id, title, String(body.description || "").trim(), String(body.objective || "").trim(),
-              String(body.rules || "").trim(), String(body.verification || "").trim(), score, turn,
-              participantId, new Date().toISOString());
-            ids.push(id);
-          }
-          logAction("judge", "mission_assigned", { missionIds: ids, roleId: body.roleId || null });
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          throw error;
-        }
-        return sendJson(res, 201, { id: ids.length === 1 ? ids[0] : null, ids, assigned: ids.length });
+        logAction(room.id, "judge", "mission_assigned", { title, assignedCount });
+        return sendJson(res, 201, { ok: true, id: createdId, assigned: assignedCount, assignedCount });
       }
 
-      if (route.startsWith("PATCH /api/judge/missions/")) {
+      if (judgeAction.startsWith("PATCH /api/judge/missions/")) {
         const id = decodeURIComponent(url.pathname.split("/").pop());
-        const mission = db.prepare("SELECT * FROM missions WHERE id = ?").get(id);
+        const mission = db.prepare("SELECT * FROM missions WHERE id = ? AND room_id = ?").get(id, room.id);
         if (!mission) return sendJson(res, 404, { error: "Missione non trovata." });
         const body = await readJson(req);
-        if (!["completed", "rejected"].includes(body.status)) return sendJson(res, 400, { error: "Esito missione non valido." });
-        if (!["submitted", "under_review"].includes(mission.status)) return sendJson(res, 409, { error: "La missione non è in attesa di verifica." });
-        const note = String(body.note || "").trim().slice(0, 2000);
-        if (body.status === "rejected" && !note) return sendJson(res, 400, { error: "Indica il motivo del rifiuto." });
+        const status = body.status;
+        if (mission.status === status) {
+          return sendJson(res, 409, { error: `La missione si trova già nello stato ${status}.` });
+        }
+        const note = String(body.note || body.reviewNote || "").trim();
         db.exec("BEGIN IMMEDIATE");
         try {
-          const current = db.prepare("SELECT status FROM missions WHERE id = ?").get(id);
-          if (!["submitted", "under_review"].includes(current.status)) throw Object.assign(new Error("La missione è già stata verificata."), { status: 409 });
-          db.prepare("UPDATE missions SET status = ?, review_note = ?, reviewed_at = ? WHERE id = ?")
-            .run(body.status, note, new Date().toISOString(), id);
-          if (body.status === "completed") {
-            db.prepare(`INSERT INTO score_ledger
-              (id, participant_id, source_type, source_id, points, reason, created_at)
-              VALUES (?, ?, 'mission', ?, ?, ?, ?)`)
-              .run(crypto.randomUUID(), mission.participant_id, id, mission.score, `Missione: ${mission.title}`, new Date().toISOString());
+          db.prepare("UPDATE missions SET status = ?, review_note = ?, reviewed_at = ? WHERE id = ? AND room_id = ?").run(
+            status, note, new Date().toISOString(), id, room.id
+          );
+          if (status === "completed" && mission.score > 0) {
+            db.prepare(`INSERT OR REPLACE INTO score_ledger
+              (id, room_id, participant_id, source_type, source_id, points, reason, created_at)
+              VALUES (?, ?, ?, 'mission', ?, ?, ?, ?)`).run(
+              crypto.randomUUID(), room.id, mission.participant_id, id, mission.score, `Completamento missione: ${mission.title}`, new Date().toISOString()
+            );
+          } else if (status === "rejected") {
+            db.prepare("DELETE FROM score_ledger WHERE room_id = ? AND source_type = 'mission' AND source_id = ?").run(room.id, id);
           }
-          logAction("judge", `mission_${body.status}`, { missionId: id, note });
           db.exec("COMMIT");
-        } catch (error) {
+        } catch (err) {
           db.exec("ROLLBACK");
-          if (error.status === 409) return sendJson(res, 409, { error: error.message });
-          throw error;
+          throw err;
         }
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/messages") {
+      if (judgeAction === "POST /api/judge/messages") {
         const body = await readJson(req);
-        const team = String(body.team || "").trim();
-        if (body.participantId && team) return sendJson(res, 400, { error: "Scegli un giocatore oppure un gruppo." });
-        const target = body.participantId
-          ? db.prepare("SELECT id FROM participants WHERE id = ?").get(body.participantId) : null;
-        if (body.participantId && !target) return sendJson(res, 404, { error: "Partecipante non trovato." });
-        if (team && !db.prepare("SELECT 1 FROM game_roles WHERE team = ? COLLATE NOCASE").get(team)) {
-          return sendJson(res, 404, { error: "Gruppo non trovato." });
-        }
         const text = String(body.body || "").trim();
-        if (!text || text.length > 5000) return sendJson(res, 400, { error: "Il messaggio deve contenere da 1 a 5000 caratteri." });
-        const id = crypto.randomUUID();
-        db.prepare(`INSERT INTO messages (id, participant_id, sender, kind, subject, body, team, created_at)
-          VALUES (?, ?, 'judge', ?, ?, ?, ?, ?)`)
-          .run(id, target?.id || null, target || team ? "message" : "announcement",
-            String(body.subject || "").trim().slice(0, 120), text, team || null, new Date().toISOString());
-        logAction("judge", target ? "private_message_sent" : team ? "group_message_sent" : "announcement_sent",
-          { participantId: target?.id || null, team: team || null });
-        return sendJson(res, 201, { id });
-      }
-
-      if (route.startsWith("PATCH /api/judge/messages/")) {
-        const id = decodeURIComponent(url.pathname.split("/").pop());
-        const message = db.prepare("SELECT * FROM messages WHERE id = ? AND kind = 'report'").get(id);
-        if (!message) return sendJson(res, 404, { error: "Segnalazione non trovata." });
-        if (message.status !== "pending") return sendJson(res, 409, { error: "La segnalazione è già stata valutata." });
-        const body = await readJson(req);
-        if (!["approved", "rejected"].includes(body.status)) return sendJson(res, 400, { error: "Esito segnalazione non valido." });
-        const note = String(body.note || "").trim().slice(0, 2000);
-        if (body.status === "rejected" && !note) return sendJson(res, 400, { error: "Indica il motivo del rifiuto." });
-        const result = db.prepare(`UPDATE messages SET status = ?, review_note = ?, reviewed_at = ?
-          WHERE id = ? AND kind = 'report' AND status = 'pending'`)
-          .run(body.status, note, new Date().toISOString(), id);
-        if (!result.changes) return sendJson(res, 409, { error: "La segnalazione è già stata valutata." });
-        logAction("judge", `report_${body.status}`, { reportId: id, participantId: message.participant_id, note });
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route.startsWith("PATCH /api/judge/actions/")) {
-        const id = decodeURIComponent(url.pathname.split("/").pop());
-        const action = db.prepare("SELECT * FROM secret_actions WHERE id = ?").get(id);
-        if (!action) return sendJson(res, 404, { error: "Azione non trovata." });
-        const body = await readJson(req);
-        if (!["approved", "rejected"].includes(body.status)) return sendJson(res, 400, { error: "Esito azione non valido." });
-        if (action.status !== "pending") return sendJson(res, 409, { error: "L'azione è già stata valutata." });
-        const points = body.score === undefined ? 0 : body.score;
-        if (!Number.isSafeInteger(points) || points < 0) return sendJson(res, 400, { error: "Il punteggio deve essere un intero non negativo." });
-        const note = String(body.note || "").trim().slice(0, 2000);
-        if (body.status === "rejected" && !note) return sendJson(res, 400, { error: "Indica il motivo del rifiuto." });
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          const current = db.prepare("SELECT status FROM secret_actions WHERE id = ?").get(id);
-          if (current.status !== "pending") throw Object.assign(new Error("L'azione è già stata valutata."), { status: 409 });
-          db.prepare("UPDATE secret_actions SET status = ?, score = ?, review_note = ?, reviewed_at = ? WHERE id = ?")
-            .run(body.status, points, note, new Date().toISOString(), id);
-          if (body.status === "approved" && points > 0) {
-            db.prepare(`INSERT INTO score_ledger
-              (id, participant_id, source_type, source_id, points, reason, created_at)
-              VALUES (?, ?, 'action', ?, ?, ?, ?)`)
-              .run(crypto.randomUUID(), action.participant_id, id, points, `Azione: ${action.title}`, new Date().toISOString());
-          }
-          logAction("judge", `action_${body.status}`, { actionId: id, points, note });
-          db.exec("COMMIT");
-        } catch (error) {
-          db.exec("ROLLBACK");
-          if (error.status === 409) return sendJson(res, 409, { error: error.message });
-          throw error;
-        }
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (route === "POST /api/judge/score-adjustment") {
-        const body = await readJson(req);
-        const participant = db.prepare("SELECT id FROM participants WHERE id = ?").get(body.participantId);
-        if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
-        if (!Number.isSafeInteger(body.points) || body.points === 0 || Math.abs(body.points) > 100000) {
-          return sendJson(res, 400, { error: "Inserisci un punteggio intero diverso da zero." });
-        }
-        const reason = String(body.reason || "").trim().slice(0, 500);
-        if (!reason) return sendJson(res, 400, { error: "La motivazione è obbligatoria." });
-        const id = crypto.randomUUID();
-        db.prepare(`INSERT INTO score_ledger
-          (id, participant_id, source_type, source_id, points, reason, created_at)
-          VALUES (?, ?, 'adjustment', ?, ?, ?, ?)`)
-          .run(id, participant.id, id, body.points, reason, new Date().toISOString());
-        logAction("judge", "score_adjusted", { participantId: participant.id, points: body.points, reason });
+        const subject = String(body.subject || "").trim().slice(0, 100);
+        if (!text) return sendJson(res, 400, { error: "Il testo della comunicazione è obbligatorio." });
+        db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, team, status, created_at)
+          VALUES (?, ?, ?, 'judge', 'announcement', ?, ?, ?, 'sent', ?)`).run(
+          crypto.randomUUID(), room.id, body.participantId || null, subject, text, body.team || null, new Date().toISOString()
+        );
+        logAction(room.id, "judge", "message_sent", { recipient: body.participantId ? "player" : body.team ? "team" : "all" });
         return sendJson(res, 201, { ok: true });
       }
 
-      if (route === "POST /api/judge/vote") {
-        const game = gameState();
-        if (game.status !== "running" && game.status !== "paused") return sendJson(res, 409, { error: "Apri la votazione durante la partita." });
-        if (!game.vote_open && db.prepare("SELECT 1 FROM votes LIMIT 1").get()) {
-          return sendJson(res, 409, { error: "La votazione è già stata chiusa e non può essere riaperta." });
+      if (judgeAction.startsWith("PATCH /api/judge/messages/")) {
+        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const msg = db.prepare("SELECT * FROM messages WHERE id = ? AND room_id = ?").get(id, room.id);
+        if (!msg) return sendJson(res, 404, { error: "Messaggio non trovato." });
+        if (msg.status === "approved" || msg.status === "rejected") {
+          return sendJson(res, 409, { error: "Questo messaggio è già stato valutato." });
         }
         const body = await readJson(req);
-        if (!Number.isSafeInteger(body.limit) || body.limit < 1 || body.limit > 100) return sendJson(res, 400, { error: "Limite voti non valido." });
-        db.prepare("UPDATE game SET vote_open = 1, vote_limit = ? WHERE id = 1").run(body.limit);
-        logAction("judge", "vote_opened", { limit: body.limit });
+        db.prepare("UPDATE messages SET status = ?, review_note = ?, reviewed_at = ? WHERE id = ? AND room_id = ?").run(
+          body.status, String(body.note || "").trim(), new Date().toISOString(), id, room.id
+        );
         return sendJson(res, 200, { ok: true });
       }
 
-      if (route === "POST /api/judge/vote/close") {
-        db.prepare("UPDATE game SET vote_open = 0 WHERE id = 1").run();
-        logAction("judge", "vote_closed");
-        return sendJson(res, 200, { ok: true });
-      }
+      if (judgeAction.startsWith("PATCH /api/judge/actions/")) {
+        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const action = db.prepare("SELECT * FROM secret_actions WHERE id = ? AND room_id = ?").get(id, room.id);
+        if (!action) return sendJson(res, 404, { error: "Azione segreta non trovata." });
+        const body = await readJson(req);
+        const status = body.status;
+        const note = String(body.note || "").trim();
+        const score = Number(body.score || 0);
 
-      if (route === "POST /api/judge/logout") {
-        const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-        judgeSessions.delete(token);
-        return sendJson(res, 200, { ok: true });
-      }
-      return sendJson(res, 404, { error: "Endpoint giudice non trovato." });
-    }
-
-    if (route === "POST /api/player/login") {
-      const body = await readJson(req);
-      const code = String(body.code || "");
-      const participants = db.prepare("SELECT id FROM participants").all();
-      const participant = participants.find((item) => equalSecret(code, playerCode(item.id)));
-      if (!participant) return sendJson(res, 401, { error: "Codice partecipante non valido." });
-      const token = crypto.randomBytes(32).toString("base64url");
-      playerSessions.set(token, participant.id);
-      return sendJson(res, 200, { token });
-    }
-
-    if (route === "GET /api/player/me") {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      const game = gameState();
-      if (!game.started_at) return sendJson(res, 409, { error: "Il giudice non ha ancora avviato la partita." });
-      const participant = db.prepare("SELECT name, role FROM participants WHERE id = ?").get(id);
-      if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
-      const role = participant.role ? db.prepare("SELECT name FROM game_roles WHERE id = ?").get(participant.role) : null;
-      return sendJson(res, 200, { name: participant.name, role: role?.name || null });
-    }
-
-    if (route === "GET /api/player/dashboard") {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      const game = gameState();
-      if (!game.started_at) return sendJson(res, 409, { error: "Il giudice non ha ancora avviato la partita." });
-      applyDeadlineFailures(game);
-      const participant = db.prepare("SELECT id, name, role FROM participants WHERE id = ?").get(id);
-      if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
-      const role = participant.role ? db.prepare("SELECT * FROM game_roles WHERE id = ?").get(participant.role) : null;
-      const settings = JSON.parse(game.settings || "{}");
-      const duration = (settings.turnDurationMinutes || 30) * 60000;
-      const remaining = game.status === "paused"
-        ? game.paused_remaining_ms
-        : Math.max(0, duration - (Date.now() - new Date(game.turn_started_at || game.started_at).getTime()));
-      const missions = db.prepare("SELECT * FROM missions WHERE participant_id = ? ORDER BY created_at DESC").all(id);
-      const messages = db.prepare(`SELECT id, sender, kind, subject, body, team, created_at, status, review_note FROM messages
-        WHERE participant_id = ? OR (participant_id IS NULL AND kind = 'announcement')
-          OR (participant_id IS NULL AND team = ?)
-        ORDER BY created_at DESC`).all(id, role?.team || "");
-      const actions = db.prepare("SELECT id, title, details, status, review_note, score, created_at FROM secret_actions WHERE participant_id = ? ORDER BY created_at DESC").all(id);
-      const voteSubmitted = db.prepare("SELECT COUNT(*) AS count FROM votes WHERE voter_id = ?").get(id).count > 0;
-      const allies = role?.team
-        ? db.prepare(`SELECT name FROM participants WHERE role IN
-            (SELECT id FROM game_roles WHERE team = ?) AND id != ? ORDER BY name`).all(role.team, id).map((row) => row.name)
-        : [];
-      const revealedPlayers = game.roles_revealed ? finalGameSummary() : null;
-      return sendJson(res, 200, {
-        name: participant.name,
-        role: role ? {
-          name: role.name, team: role.team, description: role.description,
-          objectives: role.objectives, rules: role.rules,
-          actions: role.actions.split("\n").filter(Boolean),
-        } : null,
-        allies,
-        startedAt: game.started_at,
-        game: {
-          status: game.status, currentTurn: game.current_turn,
-          turnCount: settings.turnCount || 1,
-          turnStartedAt: game.turn_started_at,
-          remainingMs: remaining,
-          rules: settings.rules || "",
-          winConditions: settings.winConditions || "",
-          voteOpen: Boolean(game.vote_open), voteLimit: game.vote_limit,
-          voteSubmitted,
-        },
-        score: personalScore(id),
-        missions,
-        messages,
-        actions,
-        candidates: game.vote_open ? db.prepare("SELECT id, name FROM participants WHERE id != ? ORDER BY name").all(id) : [],
-        finalResults: revealedPlayers,
-      });
-    }
-
-    if (route === "POST /api/player/messages") {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      if (!ensureGameRunning(res)) return;
-      const body = await readJson(req);
-      const text = String(body.body || "").trim();
-      if (!text || text.length > 5000) return sendJson(res, 400, { error: "Il messaggio deve contenere da 1 a 5000 caratteri." });
-      const kind = body.kind === "report" ? "report" : "message";
-      const messageId = crypto.randomUUID();
-      db.prepare(`INSERT INTO messages (id, participant_id, sender, kind, subject, body, created_at, status)
-        VALUES (?, ?, 'player', ?, ?, ?, ?, ?)`)
-        .run(messageId, id, kind, String(body.subject || "").trim().slice(0, 120), text,
-          new Date().toISOString(), kind === "report" ? "pending" : "sent");
-      logAction("player", kind === "report" ? "report_sent" : "message_sent", { participantId: id, messageId });
-      return sendJson(res, 201, { id: messageId, received: true });
-    }
-
-    if (route.startsWith("POST /api/player/missions/") && route.endsWith("/start")) {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      if (!ensureGameRunning(res)) return;
-      const missionId = decodeURIComponent(url.pathname.split("/")[4]);
-      const result = db.prepare("UPDATE missions SET status = 'active' WHERE id = ? AND participant_id = ? AND status = 'assigned'").run(missionId, id);
-      if (!result.changes) return sendJson(res, 409, { error: "Missione non disponibile o già avviata." });
-      logAction("player", "mission_started", { participantId: id, missionId });
-      return sendJson(res, 200, { ok: true });
-    }
-
-    if (route.startsWith("POST /api/player/missions/") && route.endsWith("/submit")) {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      if (!ensureGameRunning(res)) return;
-      const missionId = decodeURIComponent(url.pathname.split("/")[4]);
-      const body = await readJson(req);
-      const proof = String(body.proof || "").trim();
-      if (!proof || proof.length > 20000) return sendJson(res, 400, { error: "Inserisci una prova testuale da 1 a 20000 caratteri." });
-      const result = db.prepare(`UPDATE missions SET status = 'submitted', proof = ?, submitted_at = ?
-        WHERE id = ? AND participant_id = ? AND status IN ('assigned', 'active')`)
-        .run(proof, new Date().toISOString(), missionId, id);
-      if (!result.changes) return sendJson(res, 409, { error: "Missione non disponibile per l'invio." });
-      logAction("player", "mission_submitted", { participantId: id, missionId });
-      return sendJson(res, 200, { ok: true });
-    }
-
-    if (route === "POST /api/player/actions") {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      if (!ensureGameRunning(res)) return;
-      const body = await readJson(req);
-      const title = String(body.title || "").trim();
-      const details = String(body.details || "").trim();
-      if (!title || title.length > 120 || details.length > 5000) return sendJson(res, 400, { error: "Titolo o dettagli dell'azione non validi." });
-      const participant = db.prepare("SELECT role FROM participants WHERE id = ?").get(id);
-      const role = participant?.role ? db.prepare("SELECT actions FROM game_roles WHERE id = ?").get(participant.role) : null;
-      const allowedActions = role ? role.actions.split("\n").map((action) => action.trim()).filter(Boolean) : [];
-      if (!allowedActions.includes(title)) return sendJson(res, 403, { error: "Questa azione non è prevista per il tuo ruolo." });
-      const idAction = crypto.randomUUID();
-      db.prepare(`INSERT INTO secret_actions (id, participant_id, title, details, created_at)
-        VALUES (?, ?, ?, ?, ?)`).run(idAction, id, title, details, new Date().toISOString());
-      logAction("player", "secret_action_submitted", { participantId: id, actionId: idAction });
-      return sendJson(res, 201, { id: idAction });
-    }
-
-    if (route === "POST /api/player/vote") {
-      const id = getPlayerId(req);
-      if (!id) return sendJson(res, 401, { error: "Effettua l'accesso con il tuo codice privato." });
-      const game = gameState();
-      if (!game.vote_open) return sendJson(res, 409, { error: "La votazione non è aperta." });
-      const body = await readJson(req);
-      const targets = body.targets;
-      if (!Array.isArray(targets) || !targets.length || targets.length > game.vote_limit
-        || new Set(targets).size !== targets.length || targets.includes(id)) {
-        return sendJson(res, 400, { error: "Voti non validi: controlla il limite, i duplicati e il voto su te stesso." });
-      }
-      const known = new Set(db.prepare("SELECT id FROM participants").all().map((row) => row.id));
-      if (targets.some((target) => typeof target !== "string" || !known.has(target))) {
-        return sendJson(res, 400, { error: "Uno o più partecipanti selezionati non sono validi." });
-      }
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        if (!gameState().vote_open) throw Object.assign(new Error("La votazione è chiusa."), { status: 409 });
-        if (db.prepare("SELECT 1 FROM votes WHERE voter_id = ? LIMIT 1").get(id)) {
-          throw Object.assign(new Error("Hai già inviato il tuo voto."), { status: 409 });
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          db.prepare("UPDATE secret_actions SET status = ?, review_note = ?, score = ?, reviewed_at = ? WHERE id = ? AND room_id = ?").run(
+            status, note, score, new Date().toISOString(), id, room.id
+          );
+          if (status === "approved" && score > 0) {
+            db.prepare(`INSERT OR REPLACE INTO score_ledger
+              (id, room_id, participant_id, source_type, source_id, points, reason, created_at)
+              VALUES (?, ?, ?, 'action', ?, ?, ?, ?)`).run(
+              crypto.randomUUID(), room.id, action.participant_id, id, score, `Azione speciale approvata: ${action.title}`, new Date().toISOString()
+            );
+          } else if (status === "rejected") {
+            db.prepare("DELETE FROM score_ledger WHERE room_id = ? AND source_type = 'action' AND source_id = ?").run(room.id, id);
+          }
+          db.exec("COMMIT");
+        } catch (err) {
+          db.exec("ROLLBACK");
+          throw err;
         }
-        const insertVote = db.prepare("INSERT INTO votes (voter_id, target_id, created_at) VALUES (?, ?, ?)");
-        for (const target of targets) insertVote.run(id, target, new Date().toISOString());
-        logAction("player", "vote_submitted", { participantId: id });
-        db.exec("COMMIT");
-      } catch (error) {
-        db.exec("ROLLBACK");
-        if (error.status === 409) return sendJson(res, 409, { error: error.message });
-        throw error;
+        return sendJson(res, 200, { ok: true });
       }
-      return sendJson(res, 201, { ok: true });
+
+      if (judgeAction === "POST /api/judge/vote") {
+        const body = await readJson(req);
+        const limit = Number(body.limit || 1);
+        const hasVotes = db.prepare("SELECT 1 FROM votes WHERE room_id = ?").get(room.id);
+        if (hasVotes) return sendJson(res, 409, { error: "La votazione per questa sessione si è già conclusa." });
+        db.prepare("UPDATE rooms SET vote_open = 1, vote_limit = ? WHERE id = ?").run(limit, room.id);
+        logAction(room.id, "judge", "voting_opened", { limit });
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (judgeAction === "POST /api/judge/vote/close") {
+        db.prepare("UPDATE rooms SET vote_open = 0 WHERE id = ?").run(room.id);
+        logAction(room.id, "judge", "voting_closed");
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (judgeAction === "POST /api/judge/score-adjustment") {
+        const body = await readJson(req);
+        const points = Number(body.points);
+        const reason = String(body.reason || "Correzione manuale del giudice").trim();
+        if (!body.participantId || !Number.isSafeInteger(points)) {
+          return sendJson(res, 400, { error: "Specifica il partecipante e un punteggio valido." });
+        }
+        db.prepare(`INSERT INTO score_ledger (id, room_id, participant_id, source_type, source_id, points, reason, created_at)
+          VALUES (?, ?, ?, 'manual', ?, ?, ?, ?)`).run(
+          crypto.randomUUID(), room.id, body.participantId, crypto.randomUUID(), points, reason, new Date().toISOString()
+        );
+        logAction(room.id, "judge", "score_adjusted", { participantId: body.participantId, points, reason });
+        return sendJson(res, 201, { ok: true });
+      }
+
+      if (judgeAction === "POST /api/judge/logout") {
+        const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+        if (token) judgeSessions.delete(token);
+        return sendJson(res, 200, { ok: true });
+      }
     }
 
-    if (route === "POST /api/player/logout") {
-      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-      if (token) playerSessions.delete(token);
-      return sendJson(res, 200, { ok: true });
-    }
-
+    // --------------------------------------------------
+    // STATIC FILE SERVING
+    // --------------------------------------------------
     if (req.method === "GET" && !url.pathname.startsWith("/api/")) {
       const requested = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
       const filePath = path.resolve(ROOT, "public", requested);
@@ -1261,12 +1856,19 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(404);
         return res.end("Not found");
       }
-      const contentTypes = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
+      const contentTypes = {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".svg": "image/svg+xml",
+      };
       res.writeHead(200, {
         "Content-Type": contentTypes[path.extname(filePath)] || "application/octet-stream",
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
       });
       return fs.createReadStream(filePath).pipe(res);
     }
@@ -1280,12 +1882,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-setInterval(() => applyDeadlineFailures(gameState()), 15000).unref();
-
-function getLanAddresses() {
-  const interfaces = os.networkInterfaces();
-  return Object.values(interfaces).flat().filter((item) => item && item.family === "IPv4" && !item.internal).map((item) => item.address);
-}
+setInterval(() => {
+  const activeRooms = db.prepare("SELECT * FROM rooms WHERE status = 'running'").all();
+  for (const r of activeRooms) applyDeadlineFailures(r);
+}, 15000).unref();
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`La Notte dei Sospetti è pronta sulla porta ${PORT}.`);

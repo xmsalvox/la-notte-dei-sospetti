@@ -1,82 +1,78 @@
-const judgeLoginPanel = document.querySelector("#login-panel");
-const judgePanel = document.querySelector("#judge-panel");
-const participantList = document.querySelector("#participant-list");
-const roleTableBody = document.querySelector("#role-table-body");
+// ====================================================
+// LA NOTTE DEI SOSPETTI — CLIENT APPLICATION
+// Multi-Room, Smart UX, Self-Service Lobby & Role Engine
+// ====================================================
+
+const toast = document.querySelector("#toast");
 const confirmDialog = document.querySelector("#confirm-dialog");
 const proofDialog = document.querySelector("#proof-dialog");
-const toast = document.querySelector("#toast");
 
+// Session State
+let userToken = sessionStorage.getItem("userToken");
 let judgeToken = sessionStorage.getItem("judgeToken");
 let playerToken = sessionStorage.getItem("playerToken");
-let state = null;
+let currentRoomCode = sessionStorage.getItem("currentRoomCode");
+let currentUser = JSON.parse(sessionStorage.getItem("currentUser") || "null");
+
+let state = null; // Current room judge state
 let toastTimeout;
 let playerDashboard = null;
 let dashboardRefresh;
 let judgeRefresh;
+let spoilersHidden = false;
+let missionTemplates = [];
 
-function roleEntries() {
-  return state && state.roles ? Object.entries(state.roles) : [];
+// ----------------------------------------------------
+// UTILITIES & API
+// ----------------------------------------------------
+function getActiveAuthToken() {
+  return judgeToken || userToken || null;
 }
 
-function setMissionTargetType(type) {
-  const byRole = type === "role";
-  const roleField = document.querySelector("#mission-role-field");
-  const partField = document.querySelector("#mission-participant-field");
-  const partSelect = document.querySelector("#mission-participant");
-  const roleSelect = document.querySelector("#mission-role");
-  if (roleField) roleField.hidden = !byRole;
-  if (partField) partField.hidden = byRole;
-  if (partSelect) partSelect.required = !byRole;
-  if (roleSelect) roleSelect.required = byRole;
-}
-
-function setJudgeMessageTargetType(type) {
-  const partField = document.querySelector("#message-participant-field");
-  const teamField = document.querySelector("#message-team-field");
-  if (partField) partField.hidden = type !== "player";
-  if (teamField) teamField.hidden = type !== "team";
-}
-
-async function api(url, options = {}, token = judgeToken) {
+async function api(url, options = {}, token = null) {
+  const authToken = token !== null ? token : getActiveAuthToken();
   const headers = new Headers(options.headers || {});
-  if (options.body) headers.set("Content-Type", "application/json");
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (options.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (authToken) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+  if (currentRoomCode && !headers.has("X-Room-Code")) {
+    headers.set("X-Room-Code", currentRoomCode);
+  }
+
   const response = await fetch(url, { ...options, headers });
-  const payload = await response.json();
+  const payload = await response.json().catch(() => ({}));
+
   if (!response.ok) {
     if (response.status === 401) {
-      if (token === judgeToken) {
-        judgeToken = null;
-        sessionStorage.removeItem("judgeToken");
-        clearInterval(judgeRefresh);
-        showJudgeLogin();
-      } else if (token === playerToken) {
+      if (token === playerToken) {
         playerToken = null;
         sessionStorage.removeItem("playerToken");
         clearInterval(dashboardRefresh);
-        document.querySelector("#player-role-panel").hidden = true;
-        document.querySelector("#player-login-panel").hidden = false;
+        showPlayerLoginView();
       }
     }
-    throw new Error(payload.error || "Si è verificato un errore.");
+    throw new Error(payload.error || "Si è verificato un errore nella richiesta.");
   }
   return payload;
 }
 
 function showToast(message) {
+  if (!toast) return;
   toast.textContent = message;
   toast.classList.add("visible");
   clearTimeout(toastTimeout);
   toastTimeout = setTimeout(() => toast.classList.remove("visible"), 3400);
 }
 
-function showJudgeLogin() {
-  judgeLoginPanel.hidden = false;
-  judgePanel.hidden = true;
+function roleEntries() {
+  return state && state.roles ? Object.entries(state.roles) : [];
 }
 
 function setActiveView(viewId) {
-  document.querySelectorAll(".tab").forEach((tab) => {
+  document.querySelectorAll(".main-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.view === viewId);
   });
   document.querySelectorAll(".view").forEach((view) => {
@@ -93,12 +89,464 @@ function setActivePlayerSubview(subviewId) {
   });
 }
 
+function makeRecord(title, description, meta, badgeClass = "") {
+  const card = document.createElement("div");
+  card.className = "record-item";
+
+  const head = document.createElement("div");
+  head.className = "record-header";
+
+  const titleElem = document.createElement("strong");
+  titleElem.textContent = title;
+  head.append(titleElem);
+
+  if (meta) {
+    const metaElem = document.createElement("span");
+    metaElem.className = `record-meta ${badgeClass}`.trim();
+    metaElem.textContent = meta;
+    head.append(metaElem);
+  }
+  card.append(head);
+
+  if (description) {
+    const descElem = document.createElement("p");
+    descElem.className = "record-desc";
+    descElem.textContent = description;
+    card.append(descElem);
+  }
+  return card;
+}
+
+// ----------------------------------------------------
+// PLAYER JOIN & WAITING ROOM
+// ----------------------------------------------------
+function showPlayerLoginView() {
+  document.querySelector("#player-login-panel").hidden = false;
+  document.querySelector("#player-waiting-room").hidden = true;
+  document.querySelector("#player-role-panel").hidden = true;
+}
+
+function showPlayerWaitingRoom(data) {
+  document.querySelector("#player-login-panel").hidden = true;
+  document.querySelector("#player-waiting-room").hidden = false;
+  document.querySelector("#player-role-panel").hidden = true;
+
+  document.querySelector("#waiting-room-name").textContent = data.roomName || "Stanza di Gioco";
+  document.querySelector("#waiting-room-code").textContent = data.roomCode || "—";
+  document.querySelector("#waiting-participants-count").textContent = data.participantsCount || data.players?.length || 0;
+
+  const list = document.querySelector("#waiting-player-list");
+  list.replaceChildren();
+  for (const player of data.players || []) {
+    const item = document.createElement("li");
+    item.className = "waiting-player-item";
+    const dot = document.createElement("span");
+    dot.textContent = player.online ? "🟢" : "⚪";
+    const name = document.createElement("span");
+    name.textContent = player.name;
+    if (player.id === data.participant?.id) {
+      name.textContent += " (Tu)";
+      item.style.borderColor = "var(--orange)";
+    }
+    item.append(dot, name);
+    list.append(item);
+  }
+}
+
+async function loadPlayerDashboard() {
+  if (!playerToken) return;
+  try {
+    const data = await api("/api/player/dashboard", {}, playerToken);
+    playerDashboard = data;
+
+    if (data.waiting) {
+      showPlayerWaitingRoom(data);
+      return;
+    }
+
+    // Partita avviata -> Render Dashboard completa
+    document.querySelector("#player-login-panel").hidden = true;
+    document.querySelector("#player-waiting-room").hidden = true;
+    document.querySelector("#player-role-panel").hidden = false;
+    renderPlayerDashboard(data);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function renderPlayerDashboard(data) {
+  const p = data.participant;
+  document.querySelector("#player-name").textContent = p.name;
+  document.querySelector("#player-role").textContent = p.role?.name || "Non assegnato";
+  document.querySelector("#player-role-detail").textContent = p.role?.name || "Ruolo non assegnato";
+  document.querySelector("#player-team").textContent = p.role?.team || "Nessuna";
+  document.querySelector("#player-score").textContent = `${p.score} punti`;
+  document.querySelector("#player-score-total").textContent = p.score;
+  document.querySelector("#player-game-status").textContent = `Turno ${data.room.currentTurn}/${data.room.turnCount}`;
+
+  // Istruzioni Ruolo
+  const inst = document.querySelector("#player-instructions");
+  inst.replaceChildren();
+  if (p.role) {
+    if (p.role.description) {
+      const d = document.createElement("p");
+      d.innerHTML = `<strong>Descrizione:</strong> ${p.role.description}`;
+      inst.append(d);
+    }
+    if (p.role.objectives) {
+      const o = document.createElement("p");
+      o.innerHTML = `<strong>Obiettivo di vittoria:</strong> ${p.role.objectives}`;
+      inst.append(o);
+    }
+    if (p.role.rules) {
+      const r = document.createElement("p");
+      r.innerHTML = `<strong>Regole speciali:</strong> ${p.role.rules}`;
+      inst.append(r);
+    }
+  }
+
+  // Alleati (FIX: visibili SOLO a fazioni segrete operative/cospiratrici)
+  const alliesElem = document.querySelector("#player-allies");
+  if (data.allies && data.allies.length > 0) {
+    alliesElem.textContent = `👥 Compagni di squadra conosciuti: ${data.allies.join(", ")}`;
+    alliesElem.hidden = false;
+  } else {
+    alliesElem.textContent = "";
+    alliesElem.hidden = true;
+  }
+
+  // Missioni
+  const missionList = document.querySelector("#player-missions");
+  missionList.replaceChildren();
+  const activeMissionCard = document.querySelector("#player-active-mission-card");
+  activeMissionCard.replaceChildren();
+
+  const activeMission = data.missions.find((m) => ["assigned", "active"].includes(m.status));
+  if (activeMission) {
+    const card = makeRecord(
+      activeMission.title,
+      activeMission.description,
+      `${activeMission.score} pt · ${activeMission.status === 'active' ? 'In corso' : 'Assegnata'}`,
+      "badge-warning"
+    );
+    const actionBtn = document.createElement("button");
+    actionBtn.className = "button secondary";
+    actionBtn.style.marginTop = "8px";
+    if (activeMission.status === "assigned") {
+      actionBtn.textContent = "▶ Avvia Missione";
+      actionBtn.addEventListener("click", () => submitPlayerMission(activeMission.id, "start"));
+    } else {
+      actionBtn.textContent = "📤 Invia Prova al Giudice";
+      actionBtn.addEventListener("click", () => openProofModal(activeMission));
+    }
+    card.append(actionBtn);
+    activeMissionCard.append(card);
+  } else {
+    activeMissionCard.innerHTML = `<p class="empty-state">Nessuna missione attiva per questo turno.</p>`;
+  }
+
+  for (const m of data.missions) {
+    const statusLabel = {
+      assigned: "Assegnata",
+      active: "In corso",
+      submitted: "In verifica dal Giudice",
+      under_review: "In valutazione",
+      completed: "✓ Completata (+ punti)",
+      rejected: "✕ Respinta",
+    }[m.status] || m.status;
+    const badge = m.status === "completed" ? "badge-success" : m.status === "rejected" ? "badge-danger" : "badge-warning";
+    const item = makeRecord(m.title, m.description, `${m.score} pt · ${statusLabel}`, badge);
+
+    if (m.review_note) {
+      const note = document.createElement("p");
+      note.className = "record-meta";
+      note.style.marginTop = "6px";
+      note.textContent = `Nota del Giudice: ${m.review_note}`;
+      item.append(note);
+    }
+    if (m.status === "assigned") {
+      const startBtn = document.createElement("button");
+      startBtn.className = "button quiet";
+      startBtn.textContent = "▶ Avvia";
+      startBtn.addEventListener("click", () => submitPlayerMission(m.id, "start"));
+      item.append(startBtn);
+    } else if (m.status === "active") {
+      const sendProofBtn = document.createElement("button");
+      sendProofBtn.className = "button secondary";
+      sendProofBtn.textContent = "📤 Invia Prova";
+      sendProofBtn.addEventListener("click", () => openProofModal(m));
+      item.append(sendProofBtn);
+    }
+    missionList.append(item);
+  }
+
+  // Notifiche Home & Messaggi
+  const notifList = document.querySelector("#player-home-notifications");
+  const msgList = document.querySelector("#player-messages");
+  notifList.replaceChildren();
+  msgList.replaceChildren();
+  for (const msg of data.messages) {
+    const isFromMe = msg.sender === "player";
+    const rec = makeRecord(
+      msg.subject ? `${msg.subject}` : isFromMe ? "Tua comunicazione al Giudice" : "Messaggio dal Giudice",
+      msg.body,
+      new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })
+    );
+    msgList.append(rec);
+    if (!isFromMe) notifList.append(rec.cloneNode(true));
+  }
+
+  // Azioni Speciali
+  const actionTitleSelect = document.querySelector("#player-action-title");
+  actionTitleSelect.replaceChildren();
+  if (p.role?.actions?.length) {
+    for (const a of p.role.actions) {
+      actionTitleSelect.append(new Option(a, a));
+    }
+  } else {
+    actionTitleSelect.append(new Option("Azione generica", "Azione speciale"));
+  }
+
+  const actionsList = document.querySelector("#player-actions");
+  actionsList.replaceChildren();
+  for (const act of data.actions) {
+    const stLabel = act.status === "approved" ? `✓ Approvata (+${act.score} pt)` : act.status === "rejected" ? "✕ Respinta" : "In attesa di valutazione";
+    const rec = makeRecord(act.title, act.details, stLabel, act.status === "approved" ? "badge-success" : act.status === "rejected" ? "badge-danger" : "badge-warning");
+    if (act.review_note) {
+      const note = document.createElement("p");
+      note.className = "record-meta";
+      note.textContent = `Nota Giudice: ${act.review_note}`;
+      rec.append(note);
+    }
+    actionsList.append(rec);
+  }
+
+  // Regole & Condizioni
+  document.querySelector("#player-rules-content").textContent = data.room.rules || "Nessuna regola speciale inserita dal Giudice.";
+  document.querySelector("#player-win-conditions-content").textContent = data.room.winConditions || "La fazione con più punti o sopravvissuti si aggiudica la vittoria.";
+
+  // Votazione
+  const votingTabBtn = document.querySelector("#player-voting-tab-btn");
+  votingTabBtn.hidden = !data.room.voteOpen;
+  if (data.room.voteOpen) {
+    document.querySelector("#vote-instruction").textContent = `Puoi votare fino a ${data.room.voteLimit} sospetti:`;
+    const candBox = document.querySelector("#vote-candidates");
+    candBox.replaceChildren();
+    for (const c of data.candidates) {
+      const lbl = document.createElement("label");
+      lbl.className = "candidate-checkbox-label";
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.value = c.id;
+      chk.checked = data.myVotes.includes(c.id);
+      lbl.append(chk, document.createTextNode(` ${c.name}`));
+      candBox.append(lbl);
+    }
+  }
+
+  // Esito Finale
+  const resultsTabBtn = document.querySelector("#player-results-tab-btn");
+  resultsTabBtn.hidden = !data.room.rolesRevealed || !data.summary;
+  if (data.room.rolesRevealed && data.summary) {
+    renderFinalResults(data.summary, document.querySelector("#player-final-results"));
+  }
+}
+
+function renderFinalResults(summary, container) {
+  container.replaceChildren();
+  const winnersBox = document.createElement("div");
+  winnersBox.className = "highlight-score";
+  winnersBox.style.fontSize = "1.3rem";
+  winnersBox.textContent = `🎉 Squadra Vincitrice: ${summary.winningTeams.join(", ") || "Nessuna"}`;
+  container.append(winnersBox);
+
+  const table = document.createElement("table");
+  table.className = "role-table";
+  table.style.marginTop = "14px";
+  table.innerHTML = `
+    <thead><tr><th>Giocatore</th><th>Ruolo</th><th>Squadra</th><th>Punti</th></tr></thead>
+    <tbody>
+      ${summary.players.map(p => `<tr><td><strong>${p.name}</strong></td><td>${p.role || "—"}</td><td>${p.team || "—"}</td><td>${p.score} pt</td></tr>`).join("")}
+    </tbody>
+  `;
+  container.append(table);
+}
+
+function openProofModal(mission) {
+  document.querySelector("#proof-mission-id").value = mission.id;
+  document.querySelector("#proof-dialog-title").textContent = `Prova per: ${mission.title}`;
+  document.querySelector("#proof-text").value = "";
+  proofDialog.showModal();
+}
+
+async function submitPlayerMission(missionId, action, proof = "") {
+  try {
+    await api(`/api/player/missions/${encodeURIComponent(missionId)}/${action}`, {
+      method: "POST",
+      body: JSON.stringify({ proof }),
+    }, playerToken);
+    showToast(action === "start" ? "Missione avviata!" : "Prova inviata al Giudice!");
+    await loadPlayerDashboard();
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+function startPlayerPolling() {
+  clearInterval(dashboardRefresh);
+  dashboardRefresh = setInterval(() => {
+    if (playerToken) {
+      loadPlayerDashboard().catch(() => {});
+    }
+  }, 4000);
+}
+
+// ----------------------------------------------------
+// GAME MASTER (MULTI-ROOM & SMART ACTIONS)
+// ----------------------------------------------------
+function showJudgeAuthView() {
+  document.querySelector("#judge-auth-panel").hidden = false;
+  document.querySelector("#judge-rooms-manager").hidden = true;
+  document.querySelector("#judge-panel").hidden = true;
+}
+
+function showJudgeRoomsView() {
+  document.querySelector("#judge-auth-panel").hidden = true;
+  document.querySelector("#judge-rooms-manager").hidden = false;
+  document.querySelector("#judge-panel").hidden = true;
+  document.querySelector("#judge-username").textContent = currentUser?.username || "Master";
+  loadJudgeRooms();
+}
+
+async function loadJudgeRooms() {
+  try {
+    const data = await api("/api/rooms");
+    const grid = document.querySelector("#judge-rooms-list");
+    grid.replaceChildren();
+    document.querySelector("#rooms-count").textContent = `${data.rooms.length} stanze create`;
+
+    if (!data.rooms.length) {
+      grid.innerHTML = `<p class="empty-state" style="grid-column:1/-1;">Non hai ancora creato nessuna stanza. Inserisci un nome qui sopra per creare la tua prima partita!</p>`;
+      return;
+    }
+
+    for (const r of data.rooms) {
+      const card = document.createElement("div");
+      card.className = "room-card";
+
+      const header = document.createElement("div");
+      header.className = "room-card-header";
+      const title = document.createElement("h4");
+      title.className = "room-card-title";
+      title.textContent = r.name;
+      const code = document.createElement("span");
+      code.className = "room-card-code";
+      code.textContent = r.code;
+      header.append(title, code);
+
+      const meta = document.createElement("div");
+      meta.className = "room-card-meta";
+      meta.textContent = `Stato: ${r.status.toUpperCase()} · ${r.participant_count} giocatori connessi`;
+
+      const actions = document.createElement("div");
+      actions.className = "room-card-actions";
+      const enterBtn = document.createElement("button");
+      enterBtn.className = "button secondary";
+      enterBtn.textContent = "👑 Entra in Regia";
+      enterBtn.addEventListener("click", () => enterRoomAsJudge(r.code));
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "button quiet";
+      delBtn.textContent = "🗑️ Elimina";
+      delBtn.addEventListener("click", async () => {
+        if (!window.confirm(`Sei sicuro di voler eliminare la stanza "${r.name}" (${r.code})?`)) return;
+        try {
+          await api(`/api/rooms/${encodeURIComponent(r.code)}`, { method: "DELETE" });
+          showToast("Stanza eliminata.");
+          await loadJudgeRooms();
+        } catch (err) {
+          showToast(err.message);
+        }
+      });
+
+      actions.append(enterBtn, delBtn);
+      card.append(header, meta, actions);
+      grid.append(card);
+    }
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+async function enterRoomAsJudge(roomCode) {
+  currentRoomCode = roomCode;
+  sessionStorage.setItem("currentRoomCode", roomCode);
+  document.querySelector("#judge-auth-panel").hidden = true;
+  document.querySelector("#judge-rooms-manager").hidden = true;
+  document.querySelector("#judge-panel").hidden = false;
+  document.querySelector("#judge-room-code-display").textContent = roomCode;
+
+  await loadJudgeState();
+  await loadMissionTemplates();
+  startJudgePolling();
+}
+
+async function loadMissionTemplates() {
+  if (missionTemplates.length > 0) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/mission-templates` : "/api/judge/mission-templates";
+    const res = await api(url);
+    missionTemplates = res.templates || [];
+    const select = document.querySelector("#mission-template-select");
+    if (!select) return;
+    select.replaceChildren(new Option("— Seleziona una missione dal mazzo (15 disponibili) —", ""));
+    for (let i = 0; i < missionTemplates.length; i++) {
+      select.append(new Option(`${i + 1}. ${missionTemplates[i].title} (+${missionTemplates[i].score} pt)`, String(i)));
+    }
+  } catch {}
+}
+
+async function loadJudgeState(isPolling = false) {
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/state` : "/api/judge/state";
+    state = await api(url);
+
+    document.querySelector("#current-room-title").textContent = state.room?.name ? `Regia: ${state.room.name}` : "Pannello del Giudice";
+    document.querySelector("#judge-room-code-display").textContent = state.room?.code || currentRoomCode || "H4LL0";
+
+    const activeTag = document.activeElement ? document.activeElement.tagName : null;
+    const isEditing = activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT";
+
+    if (!isPolling || !isEditing) {
+      renderParticipants();
+      renderRoleConfiguration();
+      renderRoles();
+      renderValidation();
+      renderHistory();
+      renderJudgeOperations();
+      setGameLock(state.started);
+    } else {
+      // Non distruttivo durante il polling mentre il master digita
+      updateParticipantPresence();
+      renderJudgeOperations();
+    }
+    if (!isPolling) await renderJoinAddresses();
+  } catch (error) {
+    if (!isPolling) showToast(error.message);
+  }
+}
+
+function updateParticipantPresence() {
+  if (!state) return;
+  document.querySelector("#participant-count").textContent = state.participants.length;
+}
+
 function setGameLock(started) {
   const statusElement = document.querySelector("#game-status");
   if (statusElement) {
     statusElement.textContent = started
-      ? `Partita ${state.game.status} · Ruoli distribuiti e bloccati per i giocatori`
-      : "Partita in fase di preparazione (non iniziata)";
+      ? `Partita ${state.game.status.toUpperCase()} · Ruoli distribuiti e bloccati per i giocatori`
+      : "Partita in fase di preparazione (Lobby aperta)";
   }
   const historyPanel = document.querySelector("#history-panel");
   if (historyPanel) historyPanel.hidden = !started;
@@ -130,7 +578,10 @@ function createRoleSelect(participant) {
       }
     }
     try {
-      await api(`/api/judge/participants/${encodeURIComponent(participant.id)}`, {
+      const url = currentRoomCode
+        ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants/${encodeURIComponent(participant.id)}`
+        : `/api/judge/participants/${encodeURIComponent(participant.id)}`;
+      await api(url, {
         method: "PATCH",
         body: JSON.stringify({ role: select.value || null, ...(reason ? { reason } : {}) }),
       });
@@ -145,25 +596,31 @@ function createRoleSelect(participant) {
 }
 
 function renderParticipants() {
-  participantList.replaceChildren();
+  const list = document.querySelector("#participant-list");
+  list.replaceChildren();
   for (const [index, participant] of state.participants.entries()) {
     const item = document.createElement("li");
     item.className = "participant-item";
+
     const number = document.createElement("span");
     number.className = "participant-number";
     number.textContent = `${index + 1}.`;
+
+    const statusDot = document.createElement("span");
+    statusDot.textContent = participant.online ? "🟢" : "⚪";
+    statusDot.title = participant.online ? "Online in questo momento" : "Disconnesso";
+
     const input = document.createElement("input");
     input.className = "name-edit";
     input.value = participant.name;
     input.maxLength = 60;
-    input.setAttribute("aria-label", `Nome partecipante ${index + 1}`);
     input.disabled = state.started;
     input.addEventListener("change", async () => {
       try {
-        await api(`/api/judge/participants/${encodeURIComponent(participant.id)}`, {
-          method: "PATCH",
-          body: JSON.stringify({ name: input.value }),
-        });
+        const url = currentRoomCode
+          ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants/${encodeURIComponent(participant.id)}`
+          : `/api/judge/participants/${encodeURIComponent(participant.id)}`;
+        await api(url, { method: "PATCH", body: JSON.stringify({ name: input.value }) });
         await loadJudgeState();
         showToast("Nome aggiornato.");
       } catch (error) {
@@ -171,24 +628,28 @@ function renderParticipants() {
         showToast(error.message);
       }
     });
+
     const remove = document.createElement("button");
     remove.className = "remove";
     remove.type = "button";
     remove.textContent = "✕ Rimuovi";
-    remove.setAttribute("aria-label", `Rimuovi ${participant.name}`);
     remove.disabled = state.started;
     remove.addEventListener("click", async () => {
-      if (!window.confirm(`Rimuovere definitivamente ${participant.name} dall’elenco dei partecipanti?`)) return;
+      if (!window.confirm(`Rimuovere definitivamente ${participant.name} dalla stanza?`)) return;
       try {
-        await api(`/api/judge/participants/${encodeURIComponent(participant.id)}?force=true`, { method: "DELETE" });
+        const url = currentRoomCode
+          ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants/${encodeURIComponent(participant.id)}?force=true`
+          : `/api/judge/participants/${encodeURIComponent(participant.id)}?force=true`;
+        await api(url, { method: "DELETE" });
         await loadJudgeState();
         showToast(`${participant.name} rimosso.`);
       } catch (error) {
         showToast(error.message);
       }
     });
-    item.append(number, input, remove);
-    participantList.append(item);
+
+    item.append(number, statusDot, input, remove);
+    list.append(item);
   }
   document.querySelector("#participant-count").textContent = state.participants.length;
   document.querySelector("#empty-roster").hidden = state.participants.length > 0;
@@ -200,13 +661,13 @@ function renderRoleConfiguration() {
   targetList.replaceChildren();
   const entries = roleEntries();
   if (entries.length === 0) {
-    targetList.innerHTML = `<p class="empty-state" style="grid-column:1/-1;">Nessun ruolo ancora creato per la partita. Crea il tuo primo ruolo personalizzato nel form qui sopra!</p>`;
+    targetList.innerHTML = `<p class="empty-state" style="grid-column:1/-1;">Nessun ruolo configurato. Usa il form qui sopra o ricarica il preset Halloween.</p>`;
   }
   for (const [key, label] of entries) {
     const roleObj = state.rolesDetailed.find((r) => r.id === key);
     const wrapper = document.createElement("div");
     wrapper.className = "role-target-card";
-    
+
     const topRow = document.createElement("div");
     topRow.className = "role-target-top";
     const title = document.createElement("strong");
@@ -252,7 +713,10 @@ function renderRoleConfiguration() {
     delBtn.addEventListener("click", async () => {
       if (!window.confirm(`Eliminare definitivamente il ruolo "${label}" dalla partita?`)) return;
       try {
-        await api(`/api/judge/roles/${encodeURIComponent(key)}`, { method: "DELETE" });
+        const url = currentRoomCode
+          ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/${encodeURIComponent(key)}`
+          : `/api/judge/roles/${encodeURIComponent(key)}`;
+        await api(url, { method: "DELETE" });
         await loadJudgeState();
         showToast(`Ruolo "${label}" eliminato.`);
       } catch (error) {
@@ -269,15 +733,13 @@ function renderRoleConfiguration() {
   const partCount = state.participants.length;
   document.querySelector("#save-role-configuration").disabled = state.started || entries.length === 0;
   const statusTotal = document.querySelector("#role-configuration-total");
-  statusTotal.innerHTML = `Ruoli previsti configurati: <strong>${total}</strong> · Partecipanti presenti: <strong>${partCount}</strong> ${total === partCount && partCount > 0 ? '<span style="color:var(--green);">✓ (Le quantità coincidono)</span>' : total < partCount ? `<span style="color:var(--orange);">(Mancano ${partCount - total} posti ruolo)</span>` : `<span style="color:var(--red);">(Hai configurato ${total - partCount} ruoli in più)</span>`}`;
-
-  const teams = new Map();
-  for (const role of state.rolesDetailed) {
-    if (role.team) teams.set(role.team, (teams.get(role.team) || 0) + (state.limits[role.id] || 0));
-  }
-  document.querySelector("#team-count").textContent = teams.size
-    ? [...teams].map(([team, count]) => `${team}: ${count} giocatori`).join(" · ")
-    : "Nessun gruppo/fazione configurato.";
+  statusTotal.innerHTML = `Ruoli previsti configurati: <strong>${total}</strong> · Partecipanti presenti: <strong>${partCount}</strong> ${
+    total === partCount && partCount > 0
+      ? '<span style="color:var(--green);">✓ (Le quantità coincidono)</span>'
+      : total < partCount
+      ? `<span style="color:var(--orange);">(Mancano ${partCount - total} posti ruolo)</span>`
+      : `<span style="color:var(--red);">(Hai configurato ${total - partCount} ruoli in più)</span>`
+  }`;
 }
 
 function populateRoleEditor(role) {
@@ -324,13 +786,20 @@ function renderRoles() {
     counts.append(card);
   }
 
+  const roleTableBody = document.querySelector("#role-table-body");
   roleTableBody.replaceChildren();
   for (const participant of state.participants) {
     const row = document.createElement("tr");
+
     const nameCell = document.createElement("td");
     nameCell.textContent = participant.name;
+
     const roleCell = document.createElement("td");
-    roleCell.append(createRoleSelect(participant));
+    const roleWrapper = document.createElement("div");
+    roleWrapper.className = `role-cell-content ${spoilersHidden ? 'spoiler-masked' : ''}`;
+    roleWrapper.append(createRoleSelect(participant));
+    roleCell.append(roleWrapper);
+
     const accessCell = document.createElement("td");
     accessCell.className = "access-cell";
     const code = document.createElement("span");
@@ -339,32 +808,26 @@ function renderRoles() {
     const copy = document.createElement("button");
     copy.className = "copy-code";
     copy.type = "button";
-    copy.textContent = "📋 Copia codice";
+    copy.textContent = "📋 Copia";
     copy.addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText(participant.accessCode);
-        showToast(`Codice copiato per ${participant.name}. Consegnalo in privato.`);
+        showToast(`Codice copiato per ${participant.name}.`);
       } catch {
-        showToast(`Codice privato: ${participant.accessCode}`);
+        showToast(`Codice: ${participant.accessCode}`);
       }
     });
     accessCell.append(code, copy);
+
     const actionCell = document.createElement("td");
     const isOnline = participant.online;
-    actionCell.innerHTML = `<span class="online-indicator ${isOnline ? 'online' : 'offline'}">${isOnline ? '🟢 Connesso' : '⚪ Non connesso'}</span>`;
+    actionCell.innerHTML = `<span class="online-indicator ${isOnline ? 'online' : 'offline'}">${isOnline ? '🟢 Online' : '⚪ Offline'}</span>`;
+
     row.append(nameCell, roleCell, accessCell, actionCell);
     roleTableBody.append(row);
   }
-  renderRoleEditor();
-}
 
-function renderRoleEditor() {
-  const select = document.querySelector("#role-edit-select");
-  const selected = select.value;
-  select.replaceChildren(new Option("— Nuovo ruolo personalizzato —", ""));
-  for (const role of state.rolesDetailed) select.append(new Option(role.name, role.id));
-  select.value = selected;
-
+  // Safe targets synchronization (FIX role-edit-select crash!)
   const targets = ["mission-participant", "mission-role", "message-participant", "message-team", "score-participant"];
   for (const id of targets) {
     const element = document.querySelector(`#${id}`);
@@ -374,7 +837,7 @@ function renderRoleEditor() {
     if (id === "mission-role") {
       for (const [roleId, roleName] of roleEntries()) element.append(new Option(roleName, roleId));
     } else if (id === "message-team") {
-      const teams = [...new Set(state.rolesDetailed.map((role) => role.team).filter(Boolean))];
+      const teams = [...new Set(state.rolesDetailed.map((r) => r.team).filter(Boolean))];
       for (const team of teams) element.append(new Option(team, team));
     } else {
       for (const participant of state.participants) element.append(new Option(participant.name, participant.id));
@@ -382,18 +845,7 @@ function renderRoleEditor() {
     element.value = selectedValue;
   }
 
-  const missionTurn = document.querySelector("#mission-turn");
-  if (missionTurn) {
-    missionTurn.max = String(state.settings.turnCount || 1);
-    if (!missionTurn.value || Number(missionTurn.value) > Number(missionTurn.max)) {
-      missionTurn.value = state.game.currentTurn || 1;
-    }
-  }
-  const voteLimit = document.querySelector("#vote-limit");
-  if (voteLimit) {
-    voteLimit.max = String(Math.max(1, state.participants.length));
-    voteLimit.value = state.game.voteLimit || 1;
-  }
+  // Settings sync
   document.querySelector("#setting-turn-count").value = state.settings.turnCount || 1;
   document.querySelector("#setting-turn-duration").value = state.settings.turnDurationMinutes || 30;
   document.querySelector("#setting-vote-limit").value = state.game.voteLimit || 1;
@@ -401,17 +853,6 @@ function renderRoleEditor() {
   document.querySelector("#setting-rules").value = state.settings.rules || "";
   document.querySelector("#setting-win-conditions").value = state.settings.winConditions || "";
   document.querySelector("#setting-deadline-failure").checked = state.settings.deadlineFailure === true;
-
-  document.querySelector("#settings-form").querySelectorAll("input, textarea, button, select").forEach((item) => {
-    item.disabled = state.started;
-  });
-  document.querySelector("#role-editor-form").querySelectorAll("input, textarea, select, button").forEach((item) => {
-    item.disabled = state.started;
-  });
-  document.querySelector("#role-delete").hidden = !select.value || state.started;
-
-  setMissionTargetType(document.querySelector("#mission-target-type")?.value || "player");
-  setJudgeMessageTargetType(document.querySelector("#judge-message-target-type")?.value || "all");
 }
 
 function renderValidation() {
@@ -420,7 +861,7 @@ function renderValidation() {
   if (state.ready) {
     const item = document.createElement("div");
     item.className = "valid";
-    item.textContent = `✓ Configurazione valida: ${state.participants.length} partecipanti presenti, tutti assegnati esattamente secondo le quantità previste.`;
+    item.textContent = `✓ Configurazione pronta: ${state.participants.length} partecipanti presenti e assegnati esattamente secondo i posti disponibili.`;
     validation.append(item);
   } else {
     for (const issue of state.issues) {
@@ -433,14 +874,6 @@ function renderValidation() {
   if (startBtn) {
     startBtn.disabled = !state.ready || state.game.status !== "setup";
   }
-  const startHint = document.querySelector("#start-hint");
-  if (startHint) {
-    startHint.textContent = state.started
-      ? "Partita avviata. Le modifiche eccezionali ai ruoli richiedono un motivo e vengono registrate nello storico."
-      : state.game.status !== "setup" ? "La partita è terminata e non può essere riavviata."
-      : state.ready ? "Tutto pronto: puoi verificare il riepilogo riservato e confermare l’avvio della partita."
-      : "L’avvio della partita resta disabilitato finché non sono risolti tutti i punti elencati sopra.";
-  }
 }
 
 function renderHistory() {
@@ -448,70 +881,16 @@ function renderHistory() {
   if (!list) return;
   list.replaceChildren();
   if (!state.history.length) {
-    const item = document.createElement("li");
-    item.textContent = "Nessuna modifica eccezionale registrata.";
-    list.append(item);
+    list.append(makeRecord("Nessuna modifica registrata", "Le modifiche eccezionali compariranno qui.", "Vuoto"));
+    return;
   }
-  for (const entry of state.history) {
-    const item = document.createElement("li");
-    const oldRole = entry.old_role ? state.roles[entry.old_role] || entry.old_role : "non assegnato";
-    const newRole = entry.new_role ? state.roles[entry.new_role] || entry.new_role : "non assegnato";
-    item.textContent = `${new Date(entry.changed_at).toLocaleString("it-IT")} · ${entry.participant_name}: ${oldRole} → ${newRole}. Motivo: ${entry.reason}`;
-    list.append(item);
+  for (const item of state.history) {
+    list.append(makeRecord(
+      `${item.participant_name}: da ${item.old_role || "Nessuno"} a ${item.new_role || "Nessuno"}`,
+      item.reason,
+      new Date(item.changed_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })
+    ));
   }
-}
-
-function makeRecord(title, body, status, badgeClass = "") {
-  const article = document.createElement("article");
-  article.className = "record-card";
-  const heading = document.createElement("div");
-  heading.className = "record-heading";
-  const titleElement = document.createElement("strong");
-  titleElement.textContent = title;
-  const statusElement = document.createElement("span");
-  statusElement.className = `badge ${badgeClass}`;
-  statusElement.textContent = status;
-  heading.append(titleElement, statusElement);
-  article.append(heading);
-  if (body) {
-    const description = document.createElement("p");
-    description.textContent = body;
-    article.append(description);
-  }
-  return article;
-}
-
-async function judgeMissionReview(mission, status) {
-  const note = status === "rejected" ? window.prompt("Motivo del rifiuto (visibile al giocatore):") : "";
-  if (status === "rejected" && !note?.trim()) return;
-  try {
-    await api(`/api/judge/missions/${encodeURIComponent(mission.id)}`, {
-      method: "PATCH", body: JSON.stringify({ status, note }),
-    });
-    await loadJudgeState();
-    showToast(status === "completed" ? "Missione convalidata! Punti accreditati." : "Missione respinta.");
-  } catch (error) { showToast(error.message); }
-}
-
-async function judgeActionReview(action, status) {
-  const note = status === "rejected" ? window.prompt("Motivo del rifiuto (visibile al giocatore):") : "";
-  if (status === "rejected" && !note?.trim()) return;
-  let score = 0;
-  if (status === "approved") {
-    const value = window.prompt("Punti da assegnare per questa azione segreta:", "5");
-    if (value === null || !Number.isSafeInteger(Number(value)) || Number(value) < 0) {
-      showToast("Punteggio non valido.");
-      return;
-    }
-    score = Number(value);
-  }
-  try {
-    await api(`/api/judge/actions/${encodeURIComponent(action.id)}`, {
-      method: "PATCH", body: JSON.stringify({ status, note, score }),
-    });
-    await loadJudgeState();
-    showToast("Valutazione dell'azione registrata.");
-  } catch (error) { showToast(error.message); }
 }
 
 function renderJudgeTimer() {
@@ -545,169 +924,100 @@ function renderJudgeOperations() {
 
   document.querySelector("#pause-game").disabled = !running;
   document.querySelector("#resume-game").disabled = !paused;
-  document.querySelector("#next-turn").disabled = !running || game.currentTurn >= (state.settings.turnCount || 1);
+  // FIX: consenti next-turn sia in running che in paused!
+  document.querySelector("#next-turn").disabled = (!running && !paused) || game.currentTurn >= (state.settings.turnCount || 1);
   document.querySelector("#end-game").disabled = !running && !paused;
   document.querySelector("#terminate-game").disabled = !state.started || ["completed", "terminated"].includes(game.status);
-  document.querySelector("#reveal-roles").disabled = game.status !== "completed" || game.rolesRevealed;
-  document.querySelector("#vote-close").disabled = !game.voteOpen;
-  document.querySelector("#vote-open-form button[type=submit]").disabled = !running || game.voteOpen;
-  document.querySelector("#mission-form").querySelectorAll("input, textarea, select, button").forEach((item) => {
-    item.disabled = !running;
-  });
 
-  // 1. Missioni e verifiche
-  const missionList = document.querySelector("#judge-missions");
+  // Missioni lista
+  const missionList = document.querySelector("#judge-mission-list");
   missionList.replaceChildren();
   if (!state.missions.length) {
-    missionList.append(makeRecord("Nessuna missione assegnata", "Le missioni compariranno qui dopo l'assegnazione.", "Vuoto"));
+    missionList.append(makeRecord("Nessuna missione", "Usa il form o il pulsante '⚡ Distribuisci Missioni Casuali' per assegnare compiti.", "Vuoto"));
   }
-  for (const mission of state.missions) {
-    const statusLabels = {
-      assigned: "Assegnata", active: "In corso", submitted: "In verifica",
-      under_review: "In verifica", completed: "Completata", rejected: "Respinta",
-    };
-    const record = makeRecord(
-      `${mission.title} · ${mission.participant_name}`,
-      mission.description,
-      statusLabels[mission.status] || mission.status,
-      mission.status === "completed" ? "badge-success" : mission.status === "submitted" ? "badge-warning" : ""
+  for (const m of state.missions) {
+    const card = makeRecord(
+      `${m.title} — a ${m.participant_name}`,
+      `${m.description}${m.proof ? ` | Prova inviata: "${m.proof}"` : ""}`,
+      `${m.score} pt · Turno ${m.turn_number} · ${m.status}`
     );
-    const details = document.createElement("p");
-    details.innerHTML = `<strong>Turno ${mission.turn_number}</strong> · ${mission.score} punti previsti${mission.proof ? `<br>🔍 <em>Prova inviata dal giocatore:</em> "${mission.proof}"` : ""}${mission.review_note ? `<br>💬 <em>Nota del giudice:</em> "${mission.review_note}"` : ""}`;
-    record.append(details);
-
-    if (["submitted", "under_review"].includes(mission.status)) {
-      const actionsDiv = document.createElement("div");
-      actionsDiv.className = "record-actions";
-      const approve = document.createElement("button");
-      approve.className = "button secondary";
-      approve.textContent = "✓ Convalida e assegna punti";
-      approve.addEventListener("click", () => judgeMissionReview(mission, "completed"));
-      const reject = document.createElement("button");
-      reject.className = "button quiet";
-      reject.textContent = "✕ Respingi";
-      reject.addEventListener("click", () => judgeMissionReview(mission, "rejected"));
-      actionsDiv.append(approve, reject);
-      record.append(actionsDiv);
-    }
-    missionList.append(record);
-  }
-
-  // 2. Comunicazioni e segnalazioni
-  const messageList = document.querySelector("#judge-messages");
-  messageList.replaceChildren();
-  if (!state.messages.length) {
-    messageList.append(makeRecord("Nessuna comunicazione", "I messaggi dei giocatori e gli annunci inviati compariranno qui.", "Vuoto"));
-  }
-  for (const message of state.messages) {
-    const isPlayer = message.sender === "player";
-    const title = isPlayer
-      ? `${message.kind === "report" ? "🚨 Segnalazione" : "💬 Domanda"} da ${message.participant_name}`
-      : `📤 Inviato dal Giudice ${message.participant_id ? `a ${message.participant_name}` : message.team ? `alla squadra ${message.team}` : "a Tutti (Annuncio)"}`;
-    const record = makeRecord(
-      title,
-      message.body,
-      new Date(message.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }),
-      isPlayer && message.kind === "report" ? "badge-warning" : ""
-    );
-    if (message.subject) {
-      const subject = document.createElement("p");
-      subject.innerHTML = `<strong>Oggetto:</strong> ${message.subject}`;
-      record.prepend(subject);
-    }
-
-    if (isPlayer && message.kind === "report" && message.status === "pending") {
+    if (m.status === "submitted" || m.status === "under_review") {
       const btnRow = document.createElement("div");
       btnRow.className = "record-actions";
-      for (const [label, status] of [["✓ Approva segnalazione", "approved"], ["✕ Respingi", "rejected"]]) {
-        const button = document.createElement("button");
-        button.className = status === "approved" ? "button secondary" : "button quiet";
-        button.textContent = label;
-        button.addEventListener("click", async () => {
-          const note = status === "rejected" ? window.prompt("Motivo del rifiuto (visibile al mittente):") : "";
-          if (status === "rejected" && !note?.trim()) return;
-          try {
-            await api(`/api/judge/messages/${encodeURIComponent(message.id)}`, {
-              method: "PATCH", body: JSON.stringify({ status, note }),
-            });
-            await loadJudgeState();
-            showToast("Segnalazione valutata.");
-          } catch (error) { showToast(error.message); }
-        });
-        btnRow.append(button);
-      }
-      record.append(btnRow);
-    } else if (isPlayer && message.kind === "report") {
-      const result = document.createElement("p");
-      result.textContent = `Esito: ${message.status === 'approved' ? 'Approvata' : 'Respinta'}${message.review_note ? ` · Nota: ${message.review_note}` : ""}`;
-      record.append(result);
+      const completeBtn = document.createElement("button");
+      completeBtn.className = "button secondary";
+      completeBtn.textContent = "✓ Approva (+ punti)";
+      completeBtn.addEventListener("click", () => reviewMission(m.id, "completed"));
+
+      const rejectBtn = document.createElement("button");
+      rejectBtn.className = "button quiet";
+      rejectBtn.textContent = "✕ Respingi";
+      rejectBtn.addEventListener("click", () => reviewMission(m.id, "rejected"));
+
+      btnRow.append(completeBtn, rejectBtn);
+      card.append(btnRow);
     }
+    missionList.append(card);
+  }
 
-    if (isPlayer && message.participant_id) {
-      const reply = document.createElement("button");
-      reply.className = "button quiet";
-      reply.textContent = "✉️ Rispondi in privato";
-      reply.addEventListener("click", async () => {
-        const text = window.prompt(`Risposta privata per ${message.participant_name}:`);
-        if (!text?.trim()) return;
-        try {
-          await api("/api/judge/messages", {
-            method: "POST",
-            body: JSON.stringify({ participantId: message.participant_id, subject: "Risposta del Giudice", body: text }),
-          });
-          await loadJudgeState();
-          showToast(`Risposta inviata a ${message.participant_name}.`);
-        } catch (error) { showToast(error.message); }
-      });
-      record.append(reply);
+  // Messaggi lista
+  const messageList = document.querySelector("#judge-message-list");
+  messageList.replaceChildren();
+  for (const msg of state.messages) {
+    const isPlayer = msg.sender === "player";
+    const title = isPlayer ? `💬 Da ${msg.participant_name}` : `📤 Inviato dal Giudice`;
+    const rec = makeRecord(title, msg.body, new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }));
+    messageList.append(rec);
+  }
+
+  // Azioni segrete lista (FIX: mostra sia pending che già valutate)
+  const actionsList = document.querySelector("#judge-actions-list");
+  actionsList.replaceChildren();
+  if (!state.actions.length) {
+    actionsList.append(makeRecord("Nessuna azione segreta", "Le azioni speciali dichiarate dai giocatori compariranno qui.", "Vuoto"));
+  }
+  for (const act of state.actions) {
+    const isPending = act.status === "pending";
+    const rec = makeRecord(
+      `🗡️ ${act.title} — da ${act.participant_name}`,
+      act.details,
+      new Date(act.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }),
+      isPending ? "badge-warning" : act.status === "approved" ? "badge-success" : "badge-danger"
+    );
+    if (isPending) {
+      const btnRow = document.createElement("div");
+      btnRow.className = "record-actions";
+      const approveBtn = document.createElement("button");
+      approveBtn.className = "button secondary";
+      approveBtn.textContent = "✓ Approva e assegna punti";
+      approveBtn.addEventListener("click", () => reviewSecretAction(act, "approved"));
+      const rejectBtn = document.createElement("button");
+      rejectBtn.className = "button quiet";
+      rejectBtn.textContent = "✕ Respingi";
+      rejectBtn.addEventListener("click", () => reviewSecretAction(act, "rejected"));
+      btnRow.append(approveBtn, rejectBtn);
+      rec.append(btnRow);
+    } else {
+      const outcome = document.createElement("p");
+      outcome.className = "record-meta";
+      outcome.textContent = `Esito: ${act.status === 'approved' ? 'Approvata (+ ' + act.score + ' pt)' : 'Respinta'}${act.review_note ? ' · Nota: ' + act.review_note : ''}`;
+      rec.append(outcome);
     }
-    messageList.append(record);
+    actionsList.append(rec);
   }
 
-  // 3. Azioni segrete dei ruoli
-  const actionList = document.querySelector("#judge-actions");
-  actionList.replaceChildren();
-  const pendingActions = state.actions.filter((action) => action.status === "pending");
-  if (!pendingActions.length) {
-    actionList.append(makeRecord("Nessuna azione segreta in attesa", "Le azioni dei ruoli inviate dai giocatori compariranno qui.", "Vuoto"));
-  }
-  for (const action of pendingActions) {
-    const record = makeRecord(`🗡️ ${action.title} · da ${action.participant_name}`, action.details, "In attesa di valutazione");
-    const actRow = document.createElement("div");
-    actRow.className = "record-actions";
-    const approve = document.createElement("button");
-    approve.className = "button secondary";
-    approve.textContent = "✓ Approva e assegna punti";
-    approve.addEventListener("click", () => judgeActionReview(action, "approved"));
-    const reject = document.createElement("button");
-    reject.className = "button quiet";
-    reject.textContent = "✕ Respingi";
-    reject.addEventListener("click", () => judgeActionReview(action, "rejected"));
-    actRow.append(approve, reject);
-    record.append(actRow);
-    actionList.append(record);
+  // Audit log
+  const auditList = document.querySelector("#audit-log");
+  if (auditList) {
+    auditList.replaceChildren();
+    for (const entry of state.audit || []) {
+      const item = document.createElement("li");
+      item.textContent = `${new Date(entry.created_at).toLocaleTimeString("it-IT")} · [${entry.actor.toUpperCase()}] ${entry.action}: ${entry.details}`;
+      auditList.append(item);
+    }
   }
 
-  // 4. Scoreboard e classifiche
-  const scores = document.querySelector("#judge-scoreboard");
-  scores.replaceChildren();
-  const sorted = [...state.participants].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, "it"));
-  for (const participant of sorted) {
-    const item = document.createElement("li");
-    item.textContent = `${participant.name} · ${participant.score} punti${game.rolesRevealed ? ` · Ruolo: ${state.roles[participant.role] || "—"}` : ""}`;
-    scores.append(item);
-  }
-
-  // 5. Audit log
-  const audit = document.querySelector("#audit-log");
-  audit.replaceChildren();
-  for (const entry of state.audit) {
-    const item = document.createElement("li");
-    item.textContent = `${new Date(entry.created_at).toLocaleTimeString("it-IT")} · [${entry.actor.toUpperCase()}] ${entry.action}: ${entry.details}`;
-    audit.append(item);
-  }
-
-  // 6. Risultati voti
+  // Risultati voti
   const voteResults = document.querySelector("#judge-vote-results");
   voteResults.replaceChildren();
   if (game.voteOpen) {
@@ -721,31 +1031,40 @@ function renderJudgeOperations() {
   }
 }
 
-async function loadJudgeState(isPolling = false) {
+async function reviewMission(missionId, status) {
+  const note = status === "rejected" ? window.prompt("Motivo del rifiuto (visibile al giocatore):") : "";
+  if (status === "rejected" && !note?.trim()) return;
   try {
-    state = await api("/api/judge/state");
-    judgeLoginPanel.hidden = true;
-    judgePanel.hidden = false;
+    const url = currentRoomCode
+      ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/missions/${encodeURIComponent(missionId)}`
+      : `/api/judge/missions/${encodeURIComponent(missionId)}`;
+    await api(url, { method: "PATCH", body: JSON.stringify({ status, reviewNote: note }) });
+    await loadJudgeState();
+    showToast("Verifica missione registrata.");
+  } catch (err) {
+    showToast(err.message);
+  }
+}
 
-    // Se l'utente non sta digitando in un input attivo, esegui il rendering completo
-    const activeTag = document.activeElement ? document.activeElement.tagName : null;
-    const isEditing = activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT";
-
-    if (!isPolling || !isEditing) {
-      renderParticipants();
-      renderRoleConfiguration();
-      renderRoles();
-      renderValidation();
-      renderHistory();
-      renderJudgeOperations();
-      setGameLock(state.started);
-    } else {
-      // In modalità polling mentre digita, aggiorna solo le operazioni e il timer
-      renderJudgeOperations();
-    }
-    if (!isPolling) await renderJoinAddresses();
-  } catch (error) {
-    if (!isPolling) showToast(error.message);
+async function reviewSecretAction(action, status) {
+  let score = 0;
+  let note = "";
+  if (status === "approved") {
+    const val = window.prompt("Punti da assegnare per questa azione speciale:", "5");
+    if (val === null || !Number.isSafeInteger(Number(val)) || Number(val) < 0) return showToast("Punteggio non valido.");
+    score = Number(val);
+  } else {
+    note = window.prompt("Motivo del rifiuto (opzionale):") || "";
+  }
+  try {
+    const url = currentRoomCode
+      ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/actions/${encodeURIComponent(action.id)}`
+      : `/api/judge/actions/${encodeURIComponent(action.id)}`;
+    await api(url, { method: "PATCH", body: JSON.stringify({ status, note, score }) });
+    await loadJudgeState();
+    showToast("Valutazione azione registrata.");
+  } catch (err) {
+    showToast(err.message);
   }
 }
 
@@ -758,22 +1077,23 @@ async function renderJoinAddresses() {
     const isOnline = window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1";
     const headerTitle = panel.querySelector("strong");
     if (isOnline) {
-      if (headerTitle) headerTitle.textContent = "🌐 Collegamento online per tutti i partecipanti (da smartphone con 4G/5G o qualsiasi rete):";
+      if (headerTitle) headerTitle.textContent = "🌐 Collegamento online per tutti i partecipanti (4G/5G da cellulare):";
       const item = document.createElement("li");
       const link = document.createElement("a");
-      const address = window.location.origin;
+      const address = `${window.location.origin}/?room=${encodeURIComponent(currentRoomCode || state?.room?.code || "H4LL0")}`;
       link.href = address;
       link.textContent = address;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
+
       const copy = document.createElement("button");
       copy.className = "copy-code";
       copy.type = "button";
-      copy.textContent = "📋 Copia link partita";
+      copy.textContent = "📋 Copia link";
       copy.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(address);
-          showToast("Link online copiato! Invialo ai partecipanti (es. su WhatsApp).");
+          showToast("Link partita copiato!");
         } catch {
           showToast(`Link: ${address}`);
         }
@@ -783,10 +1103,9 @@ async function renderJoinAddresses() {
       panel.hidden = false;
       return;
     }
-    if (headerTitle) headerTitle.textContent = "🌐 Collegamento per i partecipanti sulla stessa rete Wi-Fi:";
     const status = await api("/api/status", {}, null);
-    const addresses = status.addresses.map((address) => `http://${address}:${status.port}`);
-    if (addresses.length === 0) addresses.push(window.location.origin);
+    const addresses = (status.addresses || []).map((address) => `http://${address}:${status.port}/?room=${encodeURIComponent(currentRoomCode || "H4LL0")}`);
+    if (addresses.length === 0) addresses.push(`${window.location.origin}/?room=${encodeURIComponent(currentRoomCode || "H4LL0")}`);
     for (const address of addresses) {
       const item = document.createElement("li");
       const link = document.createElement("a");
@@ -801,7 +1120,7 @@ async function renderJoinAddresses() {
       copy.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(address);
-          showToast("Indirizzo copiato! Condividilo con i partecipanti connessi al Wi-Fi.");
+          showToast("Indirizzo copiato!");
         } catch {
           showToast(`Indirizzo: ${address}`);
         }
@@ -815,385 +1134,426 @@ async function renderJoinAddresses() {
   }
 }
 
-// ----------------------------------------------------
-// LOGICA GIOCATORE
-// ----------------------------------------------------
-
-function renderPlayerDashboard(dashboard) {
-  playerDashboard = dashboard;
-  document.querySelector("#player-login-panel").hidden = true;
-  document.querySelector("#player-role-panel").hidden = false;
-
-  // Header & Home
-  document.querySelector("#player-name").textContent = dashboard.name;
-  document.querySelector("#player-role").textContent = dashboard.role?.name || "Ruolo non ancora assegnato";
-  document.querySelector("#player-role-detail").textContent = dashboard.role?.name || "Ruolo non assegnato";
-  document.querySelector("#player-team").textContent = dashboard.role?.team ? `Squadra ${dashboard.role.team}` : "Nessuna squadra";
-  document.querySelector("#player-score").textContent = `${dashboard.score} punti`;
-  document.querySelector("#player-score-large").textContent = dashboard.score;
-  document.querySelector("#player-game-status").textContent = `Turno ${dashboard.game.currentTurn} di ${dashboard.game.turnCount} (${dashboard.game.status})`;
-
-  // Sezione Home: Card missione attiva
-  const homeActiveCard = document.querySelector("#player-active-mission-card");
-  homeActiveCard.replaceChildren();
-  const activeMission = dashboard.missions.find((m) => ["active", "assigned", "submitted", "under_review"].includes(m.status));
-  if (activeMission) {
-    const statusLabels = { assigned: "Da iniziare", active: "In corso", submitted: "In verifica dal Giudice", under_review: "In verifica" };
-    const mCard = makeRecord(
-      activeMission.title,
-      activeMission.description,
-      statusLabels[activeMission.status] || activeMission.status,
-      activeMission.status === "active" ? "badge-warning" : ""
-    );
-    const mScore = document.createElement("p");
-    mScore.textContent = `Punti previsti: ${activeMission.score} · Turno ${activeMission.turn_number}`;
-    mCard.append(mScore);
-
-    if (activeMission.status === "assigned") {
-      const btn = document.createElement("button");
-      btn.className = "button secondary";
-      btn.textContent = "▶️ Avvia missione adesso";
-      btn.addEventListener("click", () => submitPlayerMission(activeMission.id, "start"));
-      mCard.append(btn);
+function startJudgePolling() {
+  clearInterval(judgeRefresh);
+  judgeRefresh = setInterval(() => {
+    if ((judgeToken || userToken) && !document.querySelector("#judge-panel").hidden) {
+      loadJudgeState(true).catch(() => {});
     }
-    if (["assigned", "active"].includes(activeMission.status)) {
-      const btn = document.createElement("button");
-      btn.className = "button primary";
-      btn.textContent = "📤 Invia risultato prova";
-      btn.addEventListener("click", () => openProofDialog(activeMission));
-      mCard.append(btn);
-    }
-    homeActiveCard.append(mCard);
-  } else {
-    homeActiveCard.innerHTML = `<p class="empty-state">Nessuna missione attiva in questo turno. Il giudice ti assegnerà presto un obiettivo.</p>`;
-  }
-
-  // Sezione Home: Notifiche e comunicazioni
-  const homeNotifs = document.querySelector("#player-home-notifications");
-  homeNotifs.replaceChildren();
-  const announcements = dashboard.messages.slice(0, 3);
-  if (!announcements.length) {
-    homeNotifs.append(makeRecord("Nessuna comunicazione recente", "I messaggi e gli annunci del giudice compariranno qui.", "Info"));
-  }
-  for (const msg of announcements) {
-    homeNotifs.append(makeRecord(
-      msg.subject || (msg.sender === "judge" ? "Messaggio del Giudice" : "La tua segnalazione"),
-      msg.body,
-      new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })
-    ));
-  }
-
-  // Sezione Ruolo & Istruzioni
-  const instructions = document.querySelector("#player-instructions");
-  instructions.replaceChildren();
-  for (const [label, content] of [
-    ["Descrizione del ruolo", dashboard.role?.description],
-    ["Obiettivi di vittoria", dashboard.role?.objectives],
-    ["Regole e limitazioni", dashboard.role?.rules],
-    ["Azioni consentite", dashboard.role?.actions?.join(", ")],
-  ]) {
-    if (!content) continue;
-    const p = document.createElement("p");
-    p.innerHTML = `<strong>${label}:</strong> ${content}`;
-    instructions.append(p);
-  }
-  if (!instructions.childElementCount) {
-    instructions.append(makeRecord("Ruolo standard", "Nessuna istruzione speciale configurata.", "Info"));
-  }
-  const alliesElem = document.querySelector("#player-allies");
-  alliesElem.textContent = dashboard.allies.length
-    ? `👥 Membri noti del tuo gruppo: ${dashboard.allies.join(", ")}`
-    : "Non conosci altri membri del tuo gruppo o operi in solitaria.";
-
-  // Sezione Regole
-  document.querySelector("#player-rules").textContent = dashboard.game.rules || "Nessuna regola aggiuntiva.";
-  document.querySelector("#player-win-conditions").textContent = dashboard.game.winConditions || "Condizioni standard.";
-
-  // Sezione Missioni
-  const missionsList = document.querySelector("#player-missions");
-  missionsList.replaceChildren();
-  const missionBadge = document.querySelector("#player-mission-badge");
-  const pendingCount = dashboard.missions.filter((m) => ["assigned", "active"].includes(m.status)).length;
-  if (missionBadge) {
-    missionBadge.textContent = pendingCount;
-    missionBadge.hidden = pendingCount === 0;
-  }
-  if (!dashboard.missions.length) {
-    missionsList.append(makeRecord("Nessuna missione", "Non hai ancora missioni assegnate per questo turno.", "Vuoto"));
-  }
-  const statusLabels = {
-    assigned: "Da iniziare", active: "In corso", submitted: "In verifica",
-    under_review: "In verifica", completed: "Completata ✓", rejected: "Respinta ✕",
-  };
-  for (const mission of dashboard.missions) {
-    const isCompleted = mission.status === "completed";
-    const record = makeRecord(
-      `${mission.title} · Turno ${mission.turn_number}`,
-      mission.description,
-      statusLabels[mission.status] || mission.status,
-      isCompleted ? "badge-success" : mission.status === "rejected" ? "badge-danger" : ""
-    );
-    for (const [label, val] of [
-      ["Obiettivo", mission.objective],
-      ["Regole", mission.rules],
-      ["Modalità verifica", mission.verification],
-      ["Punti previsti", `${mission.score} punti`],
-      ["La tua prova inviata", mission.proof],
-      ["Nota del Giudice", mission.review_note],
-    ]) {
-      if (!val) continue;
-      const d = document.createElement("p");
-      d.innerHTML = `<strong>${label}:</strong> ${val}`;
-      record.append(d);
-    }
-
-    if (mission.status === "assigned") {
-      const begin = document.createElement("button");
-      begin.className = "button secondary";
-      begin.textContent = "▶️ Avvia missione";
-      begin.addEventListener("click", () => submitPlayerMission(mission.id, "start"));
-      record.append(begin);
-    }
-    if (["assigned", "active"].includes(mission.status)) {
-      const submit = document.createElement("button");
-      submit.className = "button primary";
-      submit.textContent = "📤 Invia risultato prova";
-      submit.addEventListener("click", () => openProofDialog(mission));
-      record.append(submit);
-    }
-    missionsList.append(record);
-  }
-
-  // Sezione Azioni segrete
-  const actionList = document.querySelector("#player-actions");
-  actionList.replaceChildren();
-  const availableActions = dashboard.role?.actions || [];
-  const actionSelect = document.querySelector("#player-action-title");
-  actionSelect.replaceChildren(new Option("— Seleziona un'azione —", ""));
-  for (const action of availableActions) actionSelect.append(new Option(action, action));
-  document.querySelector("#player-action-form").hidden = !availableActions.length || !["running", "paused"].includes(dashboard.game.status);
-  if (!availableActions.length) {
-    actionList.append(makeRecord("Nessuna azione segreta configurata", "Il tuo ruolo non prevede azioni speciali autonome.", "Info"));
-  }
-  for (const action of dashboard.actions) {
-    actionList.append(makeRecord(
-      action.title,
-      `${action.details}${action.review_note ? `<br>💬 <em>Risposta Giudice:</em> ${action.review_note}` : ""}${action.score ? ` (+${action.score} punti)` : ""}`,
-      action.status === "approved" ? "Approvata ✓" : action.status === "rejected" ? "Respinta ✕" : "In attesa",
-      action.status === "approved" ? "badge-success" : ""
-    ));
-  }
-
-  // Sezione Comunicazioni
-  const messagesList = document.querySelector("#player-messages");
-  messagesList.replaceChildren();
-  if (!dashboard.messages.length) {
-    messagesList.append(makeRecord("Nessun messaggio", "Non ci sono ancora messaggi o segnalazioni.", "Vuoto"));
-  }
-  for (const message of dashboard.messages) {
-    const isReport = message.kind === "report";
-    const record = makeRecord(
-      message.subject || (isReport ? "Segnalazione al Giudice" : message.sender === "judge" ? "Messaggio dal Giudice" : "Messaggio inviato"),
-      message.body,
-      new Date(message.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }),
-      isReport ? "badge-warning" : ""
-    );
-    if (isReport && message.status) {
-      const st = document.createElement("p");
-      st.innerHTML = `<strong>Stato verifica:</strong> ${message.status === 'approved' ? 'Accolta ✓' : message.status === 'rejected' ? 'Non accolta' : 'In attesa'}${message.review_note ? ` — <em>${message.review_note}</em>` : ""}`;
-      record.append(st);
-    }
-    messagesList.append(record);
-  }
-
-  // Sezione Votazione
-  const votingTabBtn = document.querySelector("#player-voting-tab-btn");
-  votingTabBtn.hidden = !dashboard.game.voteOpen;
-  const candidateList = document.querySelector("#vote-candidates");
-  candidateList.replaceChildren();
-  for (const candidate of dashboard.candidates) {
-    const label = document.createElement("label");
-    label.className = "candidate";
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.name = "vote-target";
-    input.value = candidate.id;
-    input.disabled = dashboard.game.voteSubmitted;
-    input.addEventListener("change", () => {
-      const selected = [...candidateList.querySelectorAll("input:checked")];
-      if (selected.length > dashboard.game.voteLimit) input.checked = false;
-    });
-    label.append(input, document.createTextNode(` ${candidate.name}`));
-    candidateList.append(label);
-  }
-  document.querySelector("#player-vote-form button").disabled = dashboard.game.voteSubmitted;
-  document.querySelector("#vote-confirmation").textContent = dashboard.game.voteSubmitted
-    ? "✓ Voto registrato con successo. Le preferenze rimangono segrete fino al verdetto finale."
-    : `Puoi selezionare fino a ${dashboard.game.voteLimit} sospetti.`;
-
-  // Sezione Esito finale
-  const resultsTabBtn = document.querySelector("#player-results-tab-btn");
-  resultsTabBtn.hidden = !dashboard.finalResults;
-  if (dashboard.finalResults) {
-    const results = document.querySelector("#final-results");
-    results.replaceChildren();
-    const finalTeams = document.querySelector("#final-teams");
-    finalTeams.replaceChildren();
-    const summary = dashboard.finalResults;
-    const winner = summary.winningTeams.length === 1
-      ? `🏆 Squadra vincitrice: ${summary.winningTeams[0]}!`
-      : summary.winningTeams.length ? `🏆 Parità tra le squadre: ${summary.winningTeams.join(", ")}!` : "Partita conclusa.";
-    document.querySelector("#final-summary").textContent =
-      `${winner} Totale: ${summary.totalParticipants} giocatori, ${summary.completedMissions} missioni completate, ${summary.totalVotes} voti registrati.`;
-    for (const team of summary.teams) {
-      finalTeams.append(makeRecord(
-        team.team,
-        `${team.players} partecipanti · ${team.score} punti totali · ${team.completedMissions} missioni riuscite · ${team.votes} voti ricevuti`,
-        "Squadra"
-      ));
-    }
-    for (const player of summary.players) {
-      const item = document.createElement("li");
-      item.textContent = `${player.name} · Ruolo: ${player.role || "Non assegnato"} (${player.team || "Senza squadra"}) · ${player.score} punti · ${player.completed_missions} missioni · ${player.votes_received} voti ricevuti`;
-      results.append(item);
-    }
-  }
-
-  renderPlayerTimer();
-}
-
-function renderPlayerTimer() {
-  if (!playerDashboard) return;
-  const { game } = playerDashboard;
-  const elapsed = game.status === "running" ? Date.now() - playerDashboard.fetchedAt : 0;
-  const remaining = Math.max(0, game.remainingMs - elapsed);
-  const minutes = Math.floor(remaining / 60000).toString().padStart(2, "0");
-  const seconds = Math.floor((remaining % 60000) / 1000).toString().padStart(2, "0");
-  const timerElem = document.querySelector("#player-timer");
-  if (timerElem) {
-    timerElem.textContent = `${minutes}:${seconds}${remaining === 0 && game.status === "running" ? " (Tempo scaduto)" : ""}`;
-  }
-}
-
-function openProofDialog(mission) {
-  document.querySelector("#proof-dialog-title").textContent = `Prova per: ${mission.title}`;
-  document.querySelector("#proof-mission-id").value = mission.id;
-  document.querySelector("#proof-text").value = "";
-  proofDialog.showModal();
-}
-
-async function submitPlayerMission(id, action, proofText = "") {
-  try {
-    if (action === "start") {
-      await api(`/api/player/missions/${encodeURIComponent(id)}/start`, { method: "POST" }, playerToken);
-      showToast("Missione avviata! Buona fortuna.");
-    } else {
-      await api(`/api/player/missions/${encodeURIComponent(id)}/submit`, {
-        method: "POST", body: JSON.stringify({ proof: proofText }),
-      }, playerToken);
-      showToast("Prova inviata con successo al Giudice.");
-    }
-    await loadPlayerRole();
-  } catch (error) {
-    showToast(error.message);
-  }
+  }, 4000);
 }
 
 // ----------------------------------------------------
-// EVENT LISTENERS & INIZIALIZZAZIONE
+// EVENT LISTENERS INITIALIZATION
 // ----------------------------------------------------
-
-// Navigazione principale tra Giocatore e Giudice
 document.querySelectorAll(".main-tabs .tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    setActiveView(tab.dataset.view);
-  });
+  tab.addEventListener("click", () => setActiveView(tab.dataset.view));
 });
 
-// Navigazione interna schede giocatore
 document.querySelectorAll(".player-subtab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    setActivePlayerSubview(tab.dataset.subview);
-  });
+  tab.addEventListener("click", () => setActivePlayerSubview(tab.dataset.subview));
 });
 
-// Fix selezione destinatari form giudice
-document.querySelector("#mission-target-type")?.addEventListener("change", (event) => {
-  setMissionTargetType(event.target.value);
-});
-document.querySelector("#judge-message-target-type")?.addEventListener("change", (event) => {
-  setJudgeMessageTargetType(event.target.value);
-});
+// URL Query Param auto-fill for room invite: ?room=XXXXX
+const urlParams = new URLSearchParams(window.location.search);
+const inviteRoom = urlParams.get("room");
+if (inviteRoom) {
+  const roomInput = document.querySelector("#join-room-code");
+  if (roomInput) roomInput.value = inviteRoom.toUpperCase().trim();
+  setActiveView("player-view");
+}
 
-// Pulsante refresh manuale del giudice
-document.querySelector("#judge-refresh-btn")?.addEventListener("click", async () => {
-  await loadJudgeState();
-  showToast("Dati della partita aggiornati.");
-});
+// Player Join Form
+document.querySelector("#player-room-join-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const roomCode = document.querySelector("#join-room-code").value.trim().toUpperCase();
+  const name = document.querySelector("#join-player-name").value.trim();
+  const pin = document.querySelector("#join-player-pin").value.trim() || undefined;
+  const errorEl = document.querySelector("#player-login-error");
+  errorEl.textContent = "";
 
-// Nuova partita (Game Master reset)
-document.querySelector("#judge-new-game-btn")?.addEventListener("click", async () => {
-  if (!window.confirm("Vuoi iniziare una Nuova Partita? La partita tornerà in modalità di preparazione (setup) e potrai configurare partecipanti e ruoli da zero.")) return;
   try {
-    await api("/api/judge/game/reset", { method: "POST", body: JSON.stringify({ confirmed: true }) });
-    await loadJudgeState();
-    showToast("Nuova partita avviata in modalità preparazione.");
-  } catch (error) {
-    showToast(error.message);
+    const result = await api(`/api/rooms/${encodeURIComponent(roomCode)}/join`, {
+      method: "POST",
+      body: JSON.stringify({ name, pin }),
+    }, null);
+
+    playerToken = result.token;
+    sessionStorage.setItem("playerToken", playerToken);
+    await loadPlayerDashboard();
+    startPlayerPolling();
+  } catch (err) {
+    errorEl.textContent = err.message;
   }
 });
 
-// Form login giudice
-document.querySelector("#judge-login-form").addEventListener("submit", async (event) => {
+// Legacy player login toggle & submit
+document.querySelector("#toggle-legacy-player-btn")?.addEventListener("click", () => {
+  const box = document.querySelector("#legacy-player-box");
+  box.hidden = !box.hidden;
+});
+
+document.querySelector("#player-login-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const error = document.querySelector("#judge-login-error");
-  error.textContent = "";
+  const code = document.querySelector("#player-code").value.trim();
+  const errorEl = document.querySelector("#player-login-error");
+  errorEl.textContent = "";
   try {
-    const result = await api("/api/judge/login", {
+    const result = await api("/api/player/login", {
       method: "POST",
-      body: JSON.stringify({ password: document.querySelector("#judge-password").value }),
+      body: JSON.stringify({ code }),
     }, null);
-    judgeToken = result.token;
+    playerToken = result.token;
+    sessionStorage.setItem("playerToken", playerToken);
+    await loadPlayerDashboard();
+    startPlayerPolling();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+});
+
+// Player Leave Room
+document.querySelector("#waiting-leave-btn")?.addEventListener("click", async () => {
+  try {
+    await api("/api/player/logout", { method: "POST" }, playerToken);
+  } catch {}
+  playerToken = null;
+  sessionStorage.removeItem("playerToken");
+  clearInterval(dashboardRefresh);
+  showPlayerLoginView();
+  showToast("Sei uscito dalla stanza.");
+});
+
+document.querySelector("#player-logout")?.addEventListener("click", async () => {
+  try {
+    await api("/api/player/logout", { method: "POST" }, playerToken);
+  } catch {}
+  playerToken = null;
+  sessionStorage.removeItem("playerToken");
+  clearInterval(dashboardRefresh);
+  showPlayerLoginView();
+  showToast("Disconnesso dal profilo giocatore.");
+});
+
+// Modal Prova Missione Giocatore
+document.querySelector("#cancel-proof-btn")?.addEventListener("click", () => proofDialog.close());
+document.querySelector("#proof-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const id = document.querySelector("#proof-mission-id").value;
+  const proof = document.querySelector("#proof-text").value.trim();
+  if (!proof) return;
+  proofDialog.close();
+  await submitPlayerMission(id, "submit", proof);
+});
+
+// Form Messaggio Giocatore
+document.querySelector("#player-message-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/player/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: document.querySelector("#player-message-kind").value,
+        subject: document.querySelector("#player-message-subject").value,
+        body: document.querySelector("#player-message-body").value,
+      }),
+    }, playerToken);
+    document.querySelector("#player-message-subject").value = "";
+    document.querySelector("#player-message-body").value = "";
+    await loadPlayerDashboard();
+    showToast("Messaggio inviato al Giudice.");
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+// Form Azione Segreta Giocatore
+document.querySelector("#player-action-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/player/actions", {
+      method: "POST",
+      body: JSON.stringify({
+        title: document.querySelector("#player-action-title").value,
+        details: document.querySelector("#player-action-details").value,
+      }),
+    }, playerToken);
+    document.querySelector("#player-action-details").value = "";
+    await loadPlayerDashboard();
+    showToast("Azione segreta inviata al Giudice.");
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+// Form Voto Giocatore
+document.querySelector("#player-vote-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const targets = [...document.querySelectorAll("#vote-candidates input:checked")].map((i) => i.value);
+  if (!targets.length) return showToast("Seleziona almeno un sospetto prima di votare.");
+  try {
+    await api("/api/player/vote", { method: "POST", body: JSON.stringify({ targets }) }, playerToken);
+    await loadPlayerDashboard();
+    showToast("Voto segreto inviato con successo!");
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+// ----------------------------------------------------
+// GAME MASTER UI LISTENERS
+// ----------------------------------------------------
+document.querySelector("#auth-tab-login")?.addEventListener("click", () => {
+  document.querySelector("#judge-user-login-form").hidden = false;
+  document.querySelector("#judge-user-register-form").hidden = true;
+  document.querySelector("#auth-tab-login").className = "button secondary";
+  document.querySelector("#auth-tab-register").className = "button quiet";
+});
+
+document.querySelector("#auth-tab-register")?.addEventListener("click", () => {
+  document.querySelector("#judge-user-login-form").hidden = true;
+  document.querySelector("#judge-user-register-form").hidden = false;
+  document.querySelector("#auth-tab-login").className = "button quiet";
+  document.querySelector("#auth-tab-register").className = "button secondary";
+});
+
+document.querySelector("#toggle-legacy-judge-btn")?.addEventListener("click", () => {
+  const form = document.querySelector("#judge-login-form");
+  form.hidden = !form.hidden;
+});
+
+// GM User Login Form
+document.querySelector("#judge-user-login-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const username = document.querySelector("#judge-user-username").value.trim();
+  const password = document.querySelector("#judge-user-password").value;
+  const errorEl = document.querySelector("#judge-login-error");
+  errorEl.textContent = "";
+  try {
+    const res = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }, null);
+    userToken = res.token;
+    currentUser = res.user;
+    sessionStorage.setItem("userToken", userToken);
+    sessionStorage.setItem("currentUser", JSON.stringify(currentUser));
+    showJudgeRoomsView();
+    showToast(`Benvenuto, ${currentUser.username}!`);
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+});
+
+// GM User Register Form
+document.querySelector("#judge-user-register-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const username = document.querySelector("#judge-reg-username").value.trim();
+  const password = document.querySelector("#judge-reg-password").value;
+  const errorEl = document.querySelector("#judge-login-error");
+  errorEl.textContent = "";
+  try {
+    const res = await api("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }, null);
+    userToken = res.token;
+    currentUser = res.user;
+    sessionStorage.setItem("userToken", userToken);
+    sessionStorage.setItem("currentUser", JSON.stringify(currentUser));
+    showJudgeRoomsView();
+    showToast("Profilo Game Master creato con successo!");
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+});
+
+// GM Legacy Login Form
+document.querySelector("#judge-login-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const password = document.querySelector("#judge-password").value;
+  const errorEl = document.querySelector("#judge-login-error");
+  errorEl.textContent = "";
+  try {
+    const res = await api("/api/judge/login", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }, null);
+    judgeToken = res.token;
     sessionStorage.setItem("judgeToken", judgeToken);
+    document.querySelector("#judge-auth-panel").hidden = true;
+    document.querySelector("#judge-rooms-manager").hidden = true;
+    document.querySelector("#judge-panel").hidden = false;
     await loadJudgeState();
     startJudgePolling();
-  } catch (exception) {
-    error.textContent = exception.message;
+  } catch (err) {
+    errorEl.textContent = err.message;
   }
 });
 
-// Logout giudice
-document.querySelector("#judge-logout").addEventListener("click", async () => {
-  try {
-    await api("/api/judge/logout", { method: "POST" });
-  } catch {}
+// GM Logout
+document.querySelector("#judge-user-logout")?.addEventListener("click", async () => {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch {}
+  userToken = null;
+  currentUser = null;
+  sessionStorage.removeItem("userToken");
+  sessionStorage.removeItem("currentUser");
+  showJudgeAuthView();
+  showToast("Disconnesso dal profilo Game Master.");
+});
+
+document.querySelector("#judge-logout")?.addEventListener("click", async () => {
+  try { await api("/api/judge/logout", { method: "POST" }); } catch {}
   judgeToken = null;
   sessionStorage.removeItem("judgeToken");
   clearInterval(judgeRefresh);
-  showJudgeLogin();
-  showToast("Disconnesso dall'Area del Giudice.");
+  if (userToken) {
+    showJudgeRoomsView();
+  } else {
+    showJudgeAuthView();
+  }
 });
 
-// Aggiunta partecipante
-document.querySelector("#add-participant-form").addEventListener("submit", async (event) => {
+// Create Room Form
+document.querySelector("#create-room-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = document.querySelector("#new-room-name").value.trim();
+  const msg = document.querySelector("#room-create-message");
+  msg.textContent = "";
+  try {
+    const res = await api("/api/rooms", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    document.querySelector("#new-room-name").value = "";
+    showToast(`Stanza "${res.room.name}" creata!`);
+    enterRoomAsJudge(res.room.code);
+  } catch (err) {
+    msg.textContent = err.message;
+  }
+});
+
+// Back to rooms button
+document.querySelector("#judge-back-to-rooms")?.addEventListener("click", () => {
+  clearInterval(judgeRefresh);
+  currentRoomCode = null;
+  sessionStorage.removeItem("currentRoomCode");
+  showJudgeRoomsView();
+});
+
+// Copy room code & link & share
+document.querySelector("#copy-room-code-btn")?.addEventListener("click", async () => {
+  const code = document.querySelector("#judge-room-code-display").textContent;
+  try {
+    await navigator.clipboard.writeText(code);
+    showToast(`Codice stanza "${code}" copiato negli appunti!`);
+  } catch {
+    showToast(`Codice stanza: ${code}`);
+  }
+});
+
+document.querySelector("#copy-room-link-btn")?.addEventListener("click", async () => {
+  const code = document.querySelector("#judge-room-code-display").textContent;
+  const link = `${window.location.origin}/?room=${encodeURIComponent(code)}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    showToast("Link invito copiato!");
+  } catch {
+    showToast(`Link: ${link}`);
+  }
+});
+
+document.querySelector("#share-whatsapp-btn")?.addEventListener("click", () => {
+  const code = document.querySelector("#judge-room-code-display").textContent;
+  const link = `${window.location.origin}/?room=${encodeURIComponent(code)}`;
+  const text = encodeURIComponent(`🎃 Entra nella partita de "La Notte dei Sospetti"!\nCodice stanza: ${code}\nLink diretto: ${link}`);
+  window.open(`https://wa.me/?text=${text}`, "_blank");
+});
+
+// SMART BAR ACTIONS
+document.querySelector("#btn-smart-auto-balance")?.addEventListener("click", async () => {
+  if (state?.started) return showToast("La partita è già iniziata.");
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/auto-balance` : "/api/judge/auto-balance";
+    const res = await api(url, { method: "POST" });
+    await loadJudgeState();
+    showToast("⚖️ Ruoli auto-bilanciati con successo sui giocatori presenti!");
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+document.querySelector("#btn-smart-shuffle")?.addEventListener("click", async () => {
+  if (state?.started) return showToast("La partita è già iniziata.");
+  if (!window.confirm("Vuoi sorteggiare e assegnare casualmente i ruoli a tutti i partecipanti presenti nella lobby?")) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/shuffle-roles` : "/api/judge/shuffle-roles";
+    await api(url, { method: "POST" });
+    await loadJudgeState();
+    showToast("🎲 Ruoli sorteggiati e distribuiti a tutti!");
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+document.querySelector("#btn-smart-toggle-spoilers")?.addEventListener("click", () => {
+  spoilersHidden = !spoilersHidden;
+  document.querySelectorAll(".role-cell-content").forEach((el) => {
+    el.classList.toggle("spoiler-masked", spoilersHidden);
+  });
+  document.querySelector("#btn-smart-toggle-spoilers").textContent = spoilersHidden ? "👁️ Mostra Ruoli (Spoiler TV)" : "👁️ Nascondi Ruoli (Privacy TV)";
+  showToast(spoilersHidden ? "Modalità Privacy TV attiva: ruoli oscurati." : "Ruoli visibili a schermo.");
+});
+
+async function triggerBatchMissions() {
+  if (!window.confirm("Vuoi distribuire con un click una missione casuale dal mazzo a ogni partecipante per il turno attuale?")) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/missions/random-batch` : "/api/judge/missions/random-batch";
+    const res = await api(url, { method: "POST" });
+    await loadJudgeState();
+    showToast(`⚡ Assegnate con successo ${res.assignedCount} missioni casuali!`);
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+document.querySelector("#btn-batch-missions-panel")?.addEventListener("click", triggerBatchMissions);
+
+// Mission Template Select
+document.querySelector("#mission-template-select")?.addEventListener("change", (e) => {
+  const idx = e.target.value;
+  if (!idx || !missionTemplates[Number(idx)]) return;
+  const t = missionTemplates[Number(idx)];
+  document.querySelector("#mission-title").value = t.title;
+  document.querySelector("#mission-description").value = t.description;
+  document.querySelector("#mission-objective").value = t.objective;
+  document.querySelector("#mission-rules").value = t.rules;
+  document.querySelector("#mission-verification").value = t.verification;
+  document.querySelector("#mission-score").value = t.score;
+  showToast(`Template "${t.title}" caricato.`);
+});
+
+// Judge Form Add Participant
+document.querySelector("#add-participant-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = document.querySelector("#new-participant");
   const name = input.value.trim();
   try {
-    await api("/api/judge/participants", { method: "POST", body: JSON.stringify({ name }) });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants` : "/api/judge/participants";
+    await api(url, { method: "POST", body: JSON.stringify({ name }) });
     input.value = "";
-    document.querySelector("#roster-message").textContent = `✓ ${name} aggiunto all’elenco dei presenti.`;
+    document.querySelector("#roster-message").textContent = `✓ ${name} aggiunto alla stanza.`;
     await loadJudgeState();
   } catch (error) {
     document.querySelector("#roster-message").textContent = error.message;
   }
 });
 
-// Svuota tutti i partecipanti
+// Clear Participants
 document.querySelector("#clear-participants-btn")?.addEventListener("click", async () => {
-  if (!window.confirm("Sei sicuro di voler rimuovere tutti i partecipanti inseriti?")) return;
+  if (!window.confirm("Sei sicuro di voler rimuovere tutti i partecipanti dalla stanza?")) return;
   try {
-    await api("/api/judge/participants/all?force=true", { method: "DELETE" });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants/all?force=true` : "/api/judge/participants/all?force=true";
+    await api(url, { method: "DELETE" });
     await loadJudgeState();
     showToast("Tutti i partecipanti sono stati rimossi.");
   } catch (error) {
@@ -1201,51 +1561,35 @@ document.querySelector("#clear-participants-btn")?.addEventListener("click", asy
   }
 });
 
-// Svuota tutti i ruoli (Parti da zero)
+// Clear Roles & Preset Roles
 document.querySelector("#clear-roles-btn")?.addEventListener("click", async () => {
-  if (!window.confirm("Sei sicuro di voler azzerare tutti i ruoli? Potrai definire da zero i ruoli della tua partita come Game Master.")) return;
+  if (!window.confirm("Sei sicuro di voler azzerare tutti i ruoli della stanza?")) return;
   try {
-    await api("/api/judge/roles/clear", { method: "POST" });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/clear` : "/api/judge/roles/clear";
+    await api(url, { method: "POST" });
     resetRoleForm();
     await loadJudgeState();
-    showToast("Tutti i ruoli sono stati azzerati. Crea i tuoi ruoli personalizzati.");
+    showToast("Tutti i ruoli sono stati azzerati.");
   } catch (error) {
     showToast(error.message);
   }
 });
 
-// Carica preset classico Halloween
 document.querySelector("#preset-roles-btn")?.addEventListener("click", async () => {
-  if (!window.confirm("Vuoi caricare i ruoli standard del mistero di Halloween (Sentinelle, Sabotatori, Veggente, Malcapitati)?")) return;
+  if (!window.confirm("Ricaricare il preset Halloween standard (Sentinelle, Sabotatori, Veggente, Malcapitati)?")) return;
   try {
-    await api("/api/judge/roles/preset", { method: "POST" });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/preset` : "/api/judge/roles/preset";
+    await api(url, { method: "POST" });
     resetRoleForm();
     await loadJudgeState();
-    showToast("Ruoli standard di Halloween caricati.");
+    showToast("Preset ruoli Halloween ricaricato.");
   } catch (error) {
     showToast(error.message);
   }
 });
 
-// Salvataggio configurazione quantità ruoli
-document.querySelector("#role-configuration-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const message = document.querySelector("#role-configuration-message");
-  const targets = Object.fromEntries(roleEntries().map(([key]) => [key, Number(document.querySelector(`#target-${key}`).value)]));
-  try {
-    await api("/api/judge/role-configuration", {
-      method: "PUT",
-      body: JSON.stringify({ targets }),
-    });
-    message.textContent = "✓ Quantità ruoli salvata. Ora assegna ciascun ruolo manualmente ai partecipanti.";
-    await loadJudgeState();
-  } catch (error) {
-    message.textContent = error.message;
-  }
-});
-
-// Form salvataggio/creazione ruolo con quantità
-document.querySelector("#role-editor-form").addEventListener("submit", async (event) => {
+// Role editor form submit
+document.querySelector("#role-editor-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const id = document.querySelector("#role-edit-id").value;
   const count = Number(document.querySelector("#role-edit-count")?.value || 1);
@@ -1259,86 +1603,92 @@ document.querySelector("#role-editor-form").addEventListener("submit", async (ev
     actions: document.querySelector("#role-edit-actions").value,
   };
   try {
-    if (id) await api(`/api/judge/roles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(role) });
-    else await api("/api/judge/roles", { method: "POST", body: JSON.stringify(role) });
+    if (id) {
+      const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/${encodeURIComponent(id)}` : `/api/judge/roles/${encodeURIComponent(id)}`;
+      await api(url, { method: "PATCH", body: JSON.stringify(role) });
+    } else {
+      const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles` : "/api/judge/roles";
+      await api(url, { method: "POST", body: JSON.stringify(role) });
+    }
     resetRoleForm();
     await loadJudgeState();
-    showToast(id ? "Ruolo aggiornato con successo." : "Nuovo ruolo aggiunto alla partita!");
-  } catch (error) { showToast(error.message); }
+    showToast(id ? "Ruolo aggiornato." : "Nuovo ruolo aggiunto!");
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-// Annulla modifica ruolo
-document.querySelector("#role-cancel-edit-btn")?.addEventListener("click", () => {
-  resetRoleForm();
-});
+document.querySelector("#role-cancel-edit-btn")?.addEventListener("click", resetRoleForm);
 
-// Eliminazione ruolo
-document.querySelector("#role-delete").addEventListener("click", async () => {
+document.querySelector("#role-delete")?.addEventListener("click", async () => {
   const id = document.querySelector("#role-edit-id").value;
-  if (!id || !window.confirm("Eliminare definitivamente questo ruolo? L'operazione non può essere annullata.")) return;
+  if (!id || !window.confirm("Eliminare definitivamente questo ruolo?")) return;
   try {
-    await api(`/api/judge/roles/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/${encodeURIComponent(id)}` : `/api/judge/roles/${encodeURIComponent(id)}`;
+    await api(url, { method: "DELETE" });
     resetRoleForm();
     await loadJudgeState();
     showToast("Ruolo eliminato.");
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-// Salvataggio impostazioni partita
-document.querySelector("#settings-form").addEventListener("submit", async (event) => {
+// Role configuration form
+document.querySelector("#role-configuration-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const message = document.querySelector("#settings-message");
+  const message = document.querySelector("#role-configuration-message");
+  const targets = Object.fromEntries(roleEntries().map(([key]) => [key, Number(document.querySelector(`#target-${key}`)?.value || 0)]));
   try {
-    await api("/api/judge/settings", {
-      method: "PUT",
-      body: JSON.stringify({
-        turnCount: Number(document.querySelector("#setting-turn-count").value),
-        turnDurationMinutes: Number(document.querySelector("#setting-turn-duration").value),
-        voteLimit: Number(document.querySelector("#setting-vote-limit").value),
-        winMetric: document.querySelector("#setting-win-metric").value,
-        rules: document.querySelector("#setting-rules").value,
-        winConditions: document.querySelector("#setting-win-conditions").value,
-        deadlineFailure: document.querySelector("#setting-deadline-failure").checked,
-      }),
-    });
-    message.textContent = "✓ Regole e turni salvati.";
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/role-configuration` : "/api/judge/role-configuration";
+    await api(url, { method: "PUT", body: JSON.stringify({ targets }) });
+    message.textContent = "✓ Quantità ruoli salvata.";
     await loadJudgeState();
-  } catch (error) { message.textContent = error.message; }
+  } catch (error) {
+    message.textContent = error.message;
+  }
 });
 
-// Azioni del gioco (pausa, riprendi, turno, termine)
-async function gameAction(action, confirmed = false) {
-  if (confirmed && !window.confirm("Confermi questa operazione sulla partita?")) return;
-  try {
-    await api("/api/judge/game-action", {
-      method: "POST", body: JSON.stringify({ action, ...(confirmed ? { confirmed: true } : {}) }),
-    });
-    await loadJudgeState();
-    showToast("Stato della partita aggiornato.");
-  } catch (error) { showToast(error.message); }
-}
-
-document.querySelector("#pause-game").addEventListener("click", () => gameAction("pause"));
-document.querySelector("#resume-game").addEventListener("click", () => gameAction("resume"));
-document.querySelector("#next-turn").addEventListener("click", () => gameAction("next-turn", true));
-document.querySelector("#end-game").addEventListener("click", () => gameAction("end", true));
-document.querySelector("#terminate-game").addEventListener("click", () => gameAction("terminate", true));
-
-// Rivelazione ruoli finale
-document.querySelector("#reveal-roles").addEventListener("click", async () => {
-  if (!window.confirm("Dopo questa conferma i ruoli segreti e i risultati finali saranno svelati a tutti i giocatori. Confermi la rivelazione?")) return;
-  try {
-    await api("/api/judge/reveal", { method: "POST", body: JSON.stringify({ confirmed: true }) });
-    await loadJudgeState();
-    showToast("Ruoli rivelati a tutti i giocatori!");
-  } catch (error) { showToast(error.message); }
+// Start Game Modal
+document.querySelector("#start-game")?.addEventListener("click", () => {
+  const roster = document.querySelector("#confirmation-roster");
+  roster.replaceChildren();
+  for (const p of state.participants) {
+    const item = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = p.name;
+    item.append(name, document.createTextNode(` — ${state.roles[p.role] || "Non assegnato"}`));
+    roster.append(item);
+  }
+  confirmDialog.showModal();
 });
 
-// Assegnazione missione
-document.querySelector("#mission-form").addEventListener("submit", async (event) => {
+document.querySelector("#confirm-start")?.addEventListener("click", async (event) => {
   event.preventDefault();
   try {
-    await api("/api/judge/missions", {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/start` : "/api/judge/start";
+    await api(url, { method: "POST", body: JSON.stringify({ confirmed: true }) });
+    confirmDialog.close();
+    await loadJudgeState();
+    showToast("🎉 Partita avviata! I ruoli segreti sono ora distribuiti a tutti i giocatori.");
+  } catch (error) {
+    confirmDialog.close();
+    showToast(error.message);
+  }
+});
+
+// Judge Mission Form
+document.querySelector("#mission-target-type")?.addEventListener("change", (e) => {
+  const byRole = e.target.value === "role";
+  document.querySelector("#mission-role-field").hidden = !byRole;
+  document.querySelector("#mission-participant-field").hidden = byRole;
+});
+
+document.querySelector("#mission-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/missions` : "/api/judge/missions";
+    await api(url, {
       method: "POST",
       body: JSON.stringify({
         ...(document.querySelector("#mission-target-type").value === "role"
@@ -1356,18 +1706,28 @@ document.querySelector("#mission-form").addEventListener("submit", async (event)
     document.querySelector("#mission-title").value = "";
     document.querySelector("#mission-description").value = "";
     document.querySelector("#mission-objective").value = "";
+    document.querySelector("#mission-rules").value = "";
     document.querySelector("#mission-verification").value = "";
     await loadJudgeState();
     showToast("Missione assegnata con successo.");
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-// Comunicazione dal giudice
-document.querySelector("#judge-message-form").addEventListener("submit", async (event) => {
+// Judge Message Form
+document.querySelector("#judge-message-target-type")?.addEventListener("change", (e) => {
+  const type = e.target.value;
+  document.querySelector("#message-participant-field").hidden = type !== "player";
+  document.querySelector("#message-team-field").hidden = type !== "team";
+});
+
+document.querySelector("#judge-message-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const targetType = document.querySelector("#judge-message-target-type").value;
   try {
-    await api("/api/judge/messages", {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/messages` : "/api/judge/messages";
+    await api(url, {
       method: "POST",
       body: JSON.stringify({
         ...(targetType === "player" ? { participantId: document.querySelector("#message-participant").value } : {}),
@@ -1380,34 +1740,79 @@ document.querySelector("#judge-message-form").addEventListener("submit", async (
     document.querySelector("#judge-message-body").value = "";
     await loadJudgeState();
     showToast("Comunicazione inviata.");
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-// Apertura e chiusura votazione
-document.querySelector("#vote-open-form").addEventListener("submit", async (event) => {
+// Game operations actions
+async function gameAction(action, confirmed = false) {
+  if (confirmed && !window.confirm("Confermi questa operazione sulla partita?")) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/game-action` : "/api/judge/game-action";
+    await api(url, {
+      method: "POST",
+      body: JSON.stringify({ action, ...(confirmed ? { confirmed: true } : {}) }),
+    });
+    await loadJudgeState();
+    showToast("Stato della partita aggiornato.");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+document.querySelector("#pause-game")?.addEventListener("click", () => gameAction("pause"));
+document.querySelector("#resume-game")?.addEventListener("click", () => gameAction("resume"));
+document.querySelector("#next-turn")?.addEventListener("click", () => gameAction("next-turn", true));
+document.querySelector("#end-game")?.addEventListener("click", () => gameAction("end", true));
+document.querySelector("#terminate-game")?.addEventListener("click", () => gameAction("terminate", true));
+
+// Reveal roles
+document.querySelector("#reveal-roles")?.addEventListener("click", async () => {
+  if (!window.confirm("I ruoli segreti e i risultati finali saranno svelati a tutti i giocatori. Confermi?")) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/reveal` : "/api/judge/reveal";
+    await api(url, { method: "POST", body: JSON.stringify({ confirmed: true }) });
+    await loadJudgeState();
+    showToast("Ruoli rivelati a tutti i giocatori!");
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+// Vote open / close
+document.querySelector("#vote-open-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    await api("/api/judge/vote", {
-      method: "POST", body: JSON.stringify({ limit: Number(document.querySelector("#vote-limit").value) }),
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/vote` : "/api/judge/vote";
+    await api(url, {
+      method: "POST",
+      body: JSON.stringify({ limit: Number(document.querySelector("#vote-limit").value) }),
     });
     await loadJudgeState();
     showToast("Votazione aperta per tutti i partecipanti.");
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-document.querySelector("#vote-close").addEventListener("click", async () => {
+document.querySelector("#vote-close")?.addEventListener("click", async () => {
   try {
-    await api("/api/judge/vote/close", { method: "POST" });
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/vote/close` : "/api/judge/vote/close";
+    await api(url, { method: "POST" });
     await loadJudgeState();
-    showToast("Votazione chiusa. Risultati visibili al Giudice.");
-  } catch (error) { showToast(error.message); }
+    showToast("Votazione chiusa.");
+  } catch (error) {
+    showToast(error.message);
+  }
 });
 
-// Correzione manuale punteggio
-document.querySelector("#score-adjustment-form").addEventListener("submit", async (event) => {
+// Score adjustment
+document.querySelector("#score-adjustment-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    await api("/api/judge/score-adjustment", {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/score-adjustment` : "/api/judge/score-adjustment";
+    await api(url, {
       method: "POST",
       body: JSON.stringify({
         participantId: document.querySelector("#score-participant").value,
@@ -1418,180 +1823,74 @@ document.querySelector("#score-adjustment-form").addEventListener("submit", asyn
     document.querySelector("#score-reason").value = "";
     await loadJudgeState();
     showToast("Punteggio aggiornato nel registro.");
-  } catch (error) { showToast(error.message); }
-});
-
-// Modal avvio partita
-document.querySelector("#start-game").addEventListener("click", () => {
-  const roster = document.querySelector("#confirmation-roster");
-  roster.replaceChildren();
-  for (const participant of state.participants) {
-    const item = document.createElement("li");
-    const name = document.createElement("strong");
-    name.textContent = participant.name;
-    item.append(name, document.createTextNode(` — ${state.roles[participant.role] || "Non assegnato"}`));
-    roster.append(item);
-  }
-  confirmDialog.showModal();
-});
-
-document.querySelector("#confirm-start").addEventListener("click", async (event) => {
-  event.preventDefault();
-  try {
-    await api("/api/judge/start", { method: "POST", body: JSON.stringify({ confirmed: true }) });
-    confirmDialog.close();
-    await loadJudgeState();
-    showToast("🎉 Partita avviata! I ruoli sono ora distribuiti ai partecipanti.");
   } catch (error) {
-    confirmDialog.close();
     showToast(error.message);
+  }
+});
+
+// Settings form
+document.querySelector("#settings-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = document.querySelector("#settings-message");
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/settings` : "/api/judge/settings";
+    await api(url, {
+      method: "PUT",
+      body: JSON.stringify({
+        turnCount: Number(document.querySelector("#setting-turn-count").value),
+        turnDurationMinutes: Number(document.querySelector("#setting-turn-duration").value),
+        voteLimit: Number(document.querySelector("#setting-vote-limit").value),
+        winMetric: document.querySelector("#setting-win-metric").value,
+        rules: document.querySelector("#setting-rules").value,
+        winConditions: document.querySelector("#setting-win-conditions").value,
+        deadlineFailure: document.querySelector("#setting-deadline-failure").checked,
+      }),
+    });
+    message.textContent = "✓ Impostazioni salvate.";
     await loadJudgeState();
+  } catch (error) {
+    message.textContent = error.message;
   }
 });
 
-// Login Giocatore
-document.querySelector("#player-login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const error = document.querySelector("#player-login-error");
-  error.textContent = "";
+// Refresh button & new game button
+document.querySelector("#judge-refresh-btn")?.addEventListener("click", async () => {
+  await loadJudgeState();
+  showToast("Dati della partita aggiornati.");
+});
+
+document.querySelector("#judge-new-game-btn")?.addEventListener("click", async () => {
+  if (!window.confirm("Vuoi azzerare la partita per ripartire in fase di preparazione (setup)?")) return;
   try {
-    const result = await api("/api/player/login", {
-      method: "POST",
-      body: JSON.stringify({ code: document.querySelector("#player-code").value.trim() }),
-    }, null);
-    playerToken = result.token;
-    sessionStorage.setItem("playerToken", playerToken);
-    await loadPlayerRole();
-    startPlayerPolling();
-  } catch (exception) {
-    error.textContent = exception.message;
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/game/reset` : "/api/judge/game/reset";
+    await api(url, { method: "POST", body: JSON.stringify({ confirmed: true }) });
+    await loadJudgeState();
+    showToast("Partita ripristinata in preparazione.");
+  } catch (error) {
+    showToast(error.message);
   }
 });
 
-async function loadPlayerRole() {
-  const result = await api("/api/player/dashboard", {}, playerToken);
-  result.fetchedAt = Date.now();
-  renderPlayerDashboard(result);
-}
-
-// Logout Giocatore
-document.querySelector("#player-logout").addEventListener("click", async () => {
-  try {
-    await api("/api/player/logout", { method: "POST" }, playerToken);
-  } catch {}
-  playerToken = null;
-  sessionStorage.removeItem("playerToken");
-  clearInterval(dashboardRefresh);
-  document.querySelector("#player-role-panel").hidden = true;
-  document.querySelector("#player-login-panel").hidden = false;
-  showToast("Disconnesso dal profilo giocatore.");
-});
-
-// Dialog prova missione
-document.querySelector("#cancel-proof-btn").addEventListener("click", () => {
-  proofDialog.close();
-});
-
-document.querySelector("#proof-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const id = document.querySelector("#proof-mission-id").value;
-  const proofText = document.querySelector("#proof-text").value.trim();
-  if (!proofText) return;
-  proofDialog.close();
-  await submitPlayerMission(id, "submit", proofText);
-});
-
-// Form messaggio giocatore
-document.querySelector("#player-message-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  try {
-    await api("/api/player/messages", {
-      method: "POST",
-      body: JSON.stringify({
-        kind: document.querySelector("#player-message-kind").value,
-        subject: document.querySelector("#player-message-subject").value,
-        body: document.querySelector("#player-message-body").value,
-      }),
-    }, playerToken);
-    document.querySelector("#player-message-subject").value = "";
-    document.querySelector("#player-message-body").value = "";
-    await loadPlayerRole();
-    showToast("Messaggio inviato in totale riservatezza al Giudice.");
-  } catch (error) { showToast(error.message); }
-});
-
-// Form azione segreta giocatore
-document.querySelector("#player-action-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  try {
-    await api("/api/player/actions", {
-      method: "POST",
-      body: JSON.stringify({
-        title: document.querySelector("#player-action-title").value,
-        details: document.querySelector("#player-action-details").value,
-      }),
-    }, playerToken);
-    document.querySelector("#player-action-details").value = "";
-    await loadPlayerRole();
-    showToast("Azione segreta inviata al Giudice per la valutazione.");
-  } catch (error) { showToast(error.message); }
-});
-
-// Form voto sospetti giocatore
-document.querySelector("#player-vote-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const targets = [...document.querySelectorAll("#vote-candidates input:checked")].map((input) => input.value);
-  if (!targets.length) {
-    showToast("Seleziona almeno un sospetto prima di votare.");
-    return;
-  }
-  try {
-    await api("/api/player/vote", { method: "POST", body: JSON.stringify({ targets }) }, playerToken);
-    await loadPlayerRole();
-    showToast("Voto segreto inviato con successo!");
-  } catch (error) { showToast(error.message); }
-});
-
-// Polling automatico
-function startPlayerPolling() {
-  clearInterval(dashboardRefresh);
-  dashboardRefresh = setInterval(() => {
-    if (playerToken && !document.querySelector("#player-role-panel").hidden) {
-      loadPlayerRole().catch(() => {});
-    }
-  }, 10000);
-}
-
-function startJudgePolling() {
-  clearInterval(judgeRefresh);
-  judgeRefresh = setInterval(() => {
-    if (judgeToken && !judgePanel.hidden) {
-      loadJudgeState(true).catch(() => {});
-    }
-  }, 6000);
-}
-
-setInterval(renderPlayerTimer, 1000);
+// Timers
 setInterval(renderJudgeTimer, 1000);
 
-// Inizializzazione sessioni salvate
-if (judgeToken) {
-  loadJudgeState().then(() => {
-    setActiveView("judge-view");
-    startJudgePolling();
-  }).catch(() => {
-    judgeToken = null;
-    sessionStorage.removeItem("judgeToken");
-    showJudgeLogin();
-  });
-}
-
+// Auto-init on page load
 if (playerToken) {
-  loadPlayerRole().then(() => {
+  loadPlayerDashboard().then(() => {
     setActiveView("player-view");
     startPlayerPolling();
   }).catch(() => {
     playerToken = null;
     sessionStorage.removeItem("playerToken");
   });
+}
+
+if (userToken) {
+  if (currentRoomCode) {
+    enterRoomAsJudge(currentRoomCode);
+  } else {
+    showJudgeRoomsView();
+  }
+} else if (judgeToken) {
+  enterRoomAsJudge("H4LL0");
 }
