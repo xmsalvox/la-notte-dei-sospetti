@@ -345,7 +345,7 @@
             </div>
             <div class="header-actions">
               <span id="judge-user-badge" class="badge" style="font-size:0.9rem;">Master</span>
-              <button id="judge-user-logout" class="button quiet" type="button">Esci</button>
+              <button id="judge-user-logout" class="button quiet" type="button">🚪 Logout Account</button>
             </div>
           </div>
           <p>Crea una stanza per ogni festa o gruppo di amici. I partecipanti useranno il codice stanza a 5 lettere per connettersi dai loro smartphone.</p>
@@ -406,7 +406,7 @@
             <div class="header-actions">
               <button id="judge-refresh-btn" class="button secondary" type="button" title="Aggiorna dati in tempo reale">🔄 Aggiorna</button>
               <button id="judge-new-game-btn" class="button quiet" type="button" title="Azzera la partita e riparti da zero">🔄 Nuova Partita</button>
-              <button id="judge-logout" class="button quiet" type="button">Esci</button>
+              <button id="judge-logout" class="button quiet" type="button">📂 Esci dalla Regia (La stanza resta attiva)</button>
             </div>
           </div>
 
@@ -679,6 +679,8 @@
                   <button class="button secondary" type="submit">Salva Punteggio</button>
                 </div>
               </form>
+              <h4 style="margin-top:16px;">Classifica attuale</h4>
+              <ol id="judge-scoreboard" class="scoreboard"></ol>
             </div>
 
             <!-- RIVELAZIONE RUOLI FINALE -->

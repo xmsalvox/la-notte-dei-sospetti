@@ -41,6 +41,15 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    user_id TEXT,
+    room_id TEXT,
+    participant_id TEXT,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS rooms (
     id TEXT PRIMARY KEY,
     code TEXT UNIQUE COLLATE NOCASE,
@@ -475,6 +484,42 @@ const judgeSessions = new Map();
 // playerSessions: token -> { participantId, roomId }
 const playerSessions = new Map();
 
+// Load persistent sessions from SQLite database
+try {
+  const loadedSessions = db.prepare("SELECT * FROM sessions").all();
+  for (const s of loadedSessions) {
+    if (s.type === "user") {
+      userSessions.set(s.token, s.user_id);
+    } else if (s.type === "judge") {
+      judgeSessions.set(s.token, { userId: s.user_id, activeRoomId: s.room_id });
+    } else if (s.type === "player") {
+      playerSessions.set(s.token, { participantId: s.participant_id, roomId: s.room_id });
+    }
+  }
+} catch (err) {
+  console.error("Error loading sessions from db:", err);
+}
+
+function saveSession(token, type, { userId = null, roomId = null, participantId = null } = {}) {
+  try {
+    db.prepare(`INSERT OR REPLACE INTO sessions (token, type, user_id, room_id, participant_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(
+      token, type, userId, roomId, participantId, new Date().toISOString()
+    );
+  } catch (err) {
+    console.error("Save session error:", err);
+  }
+}
+
+function removeSession(token) {
+  if (!token) return;
+  try {
+    db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+  } catch (err) {
+    console.error("Remove session error:", err);
+  }
+}
+
 function playerCode(id) {
   return crypto.createHmac("sha256", roleSecret).update(`player:${id}`).digest("base64url");
 }
@@ -565,7 +610,7 @@ function isJudge(req, room) {
   const uId = userSessions.get(token);
   if (!uId) return false;
   if (isSupervisor(req)) return true; // Supervisor has GM rights to inspect and control all rooms!
-  if (!room || room.owner_id === uId || room.id === defaultRoom.id) return true;
+  if (!room || room.owner_id === uId) return true;
   return false;
 }
 
@@ -740,12 +785,6 @@ function applyDeadlineFailures(room) {
   }
 }
 
-function logAction(roomId, actor, action, details = {}) {
-  db.prepare("INSERT INTO audit_log (room_id, actor, action, details, created_at) VALUES (?, ?, ?, ?, ?)").run(
-    roomId, actor, action, typeof details === "string" ? details : JSON.stringify(details), new Date().toISOString()
-  );
-}
-
 function autoBalanceRoles(roomId) {
   const pCount = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ?").get(roomId).count;
   const roles = db.prepare("SELECT id, name FROM game_roles WHERE room_id = ? ORDER BY id").all(roomId);
@@ -794,7 +833,13 @@ function shuffleRolesForRoom(roomId) {
   if (participants.length === 0) {
     throw new Error("Nessun partecipante nella stanza per eseguire il sorteggio.");
   }
-  const roles = db.prepare("SELECT id, name, target_count FROM game_roles WHERE room_id = ?").all(roomId);
+  let roles = db.prepare("SELECT id, name, target_count FROM game_roles WHERE room_id = ?").all(roomId);
+  const targetTotal = roles.reduce((sum, r) => sum + (r.target_count || 0), 0);
+  if (targetTotal !== participants.length) {
+    autoBalanceRoles(roomId);
+    roles = db.prepare("SELECT id, name, target_count FROM game_roles WHERE room_id = ?").all(roomId);
+  }
+
   const pool = [];
   for (const r of roles) {
     for (let i = 0; i < r.target_count; i++) pool.push(r.id);
@@ -912,6 +957,7 @@ const server = http.createServer(async (req, res) => {
       );
       const token = crypto.randomBytes(32).toString("base64url");
       userSessions.set(token, userId);
+      saveSession(token, "user", { userId });
       return sendJson(res, 201, { token, user: { id: userId, username, is_supervisor: false } });
     }
 
@@ -925,6 +971,7 @@ const server = http.createServer(async (req, res) => {
       }
       const token = crypto.randomBytes(32).toString("base64url");
       userSessions.set(token, user.id);
+      saveSession(token, "user", { userId: user.id });
       return sendJson(res, 200, { token, user: { id: user.id, username: user.username, is_supervisor: Boolean(user.is_supervisor) } });
     }
 
@@ -941,6 +988,7 @@ const server = http.createServer(async (req, res) => {
       if (token) {
         userSessions.delete(token);
         judgeSessions.delete(token);
+        removeSession(token);
       }
       return sendJson(res, 200, { ok: true });
     }
@@ -954,7 +1002,9 @@ const server = http.createServer(async (req, res) => {
       const valid = (admin && verifyPassword(inputPass, admin.password_hash)) || inputPass === judgePassword;
       if (!valid) return sendJson(res, 401, { error: "Password giudice non corretta." });
       const token = crypto.randomBytes(32).toString("base64url");
-      judgeSessions.set(token, { userId: admin?.id || defaultUser.id, activeRoomId: defaultRoom.id });
+      const activeAdminId = admin?.id || defaultUser.id;
+      judgeSessions.set(token, { userId: activeAdminId, activeRoomId: defaultRoom.id });
+      saveSession(token, "judge", { userId: activeAdminId, roomId: defaultRoom.id });
       return sendJson(res, 200, { token });
     }
 
@@ -1027,11 +1077,14 @@ const server = http.createServer(async (req, res) => {
     if (route.startsWith("DELETE /api/rooms/")) {
       const userId = requireUser(req, res);
       if (!userId) return;
-      const code = url.pathname.split("/")[3];
+      const code = decodeURIComponent(url.pathname.split("/")[3]);
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
-      if (room.owner_id !== userId) return sendJson(res, 403, { error: "Non sei il proprietario di questa stanza." });
+      if (room.owner_id !== userId && !isSupervisor(req)) {
+        return sendJson(res, 403, { error: "Non sei autorizzato a eliminare questa stanza." });
+      }
       db.prepare("DELETE FROM rooms WHERE id = ?").run(room.id);
+      logAction(room.id, isSupervisor(req) ? "supervisor" : "judge", "room_deleted", { code: room.code, name: room.name });
       return sendJson(res, 200, { ok: true });
     }
 
@@ -1039,10 +1092,10 @@ const server = http.createServer(async (req, res) => {
     // PLAYER JOIN (LOBBY WITH CODE + NICKNAME + PIN)
     // --------------------------------------------------
     if (route.match(/^POST \/api\/rooms\/[^/]+\/join$/) || route === "POST /api/player/join") {
-      const code = route.match(/^POST \/api\/rooms\/([^/]+)\/join$/)?.[1] || (await readJson(req)).roomCode;
+      const body = await readJson(req);
+      const code = route.match(/^POST \/api\/rooms\/([^/]+)\/join$/)?.[1] || body.roomCode;
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Codice stanza inesistente. Verifica il codice a 5 lettere." });
-      const body = await readJson(req);
       const name = String(body.name || "").trim();
       const pin = body.pin ? String(body.pin).trim() : null;
 
@@ -1072,6 +1125,7 @@ const server = http.createServer(async (req, res) => {
 
       const token = crypto.randomBytes(32).toString("base64url");
       playerSessions.set(token, { participantId, roomId: room.id });
+      saveSession(token, "player", { participantId, roomId: room.id });
       return sendJson(res, 200, {
         token,
         participant: { id: participantId, name, role: existing?.role || null },
@@ -1088,6 +1142,7 @@ const server = http.createServer(async (req, res) => {
       if (!match) return sendJson(res, 401, { error: "Codice giocatore non riconosciuto." });
       const token = crypto.randomBytes(32).toString("base64url");
       playerSessions.set(token, { participantId: match.id, roomId: match.room_id });
+      saveSession(token, "player", { participantId: match.id, roomId: match.room_id });
       return sendJson(res, 200, { token });
     }
 
@@ -1147,10 +1202,10 @@ const server = http.createServer(async (req, res) => {
         : null;
 
       // Fix Alleati: Solo fazioni cospiratrici/operative vedono i compagni; mai Malcapitati o Veggente!
-      const isHiddenInnocent = !role || role.team === "Malcapitati" || role.id === "veggente";
-      const allies = !isHiddenInnocent
-        ? db.prepare("SELECT name FROM participants WHERE room_id = ? AND role = ? AND id != ? ORDER BY name")
-            .all(roomId, participant.role, participant.id)
+      const isHiddenInnocent = !role || !role.team || role.team.toLowerCase() === "malcapitati" || role.id === "veggente";
+      const allies = !isHiddenInnocent && role.team
+        ? db.prepare(`SELECT name FROM participants WHERE room_id = ? AND role IN (SELECT id FROM game_roles WHERE room_id = ? AND LOWER(team) = LOWER(?)) AND id != ? ORDER BY name`)
+            .all(roomId, roomId, role.team, participant.id)
             .map((r) => r.name)
         : [];
 
@@ -1313,8 +1368,19 @@ const server = http.createServer(async (req, res) => {
 
     if (route === "POST /api/player/logout") {
       const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-      if (token) playerSessions.delete(token);
+      if (token) {
+        playerSessions.delete(token);
+        removeSession(token);
+      }
       return sendJson(res, 200, { ok: true });
+    }
+
+    if (route === "GET /api/judge/mission-templates" || route.match(/\/judge\/mission-templates$/)) {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      if (!token || (!userSessions.has(token) && !judgeSessions.has(token))) {
+        return sendJson(res, 401, { error: "Accesso giudice richiesto." });
+      }
+      return sendJson(res, 200, { templates: HALLOWEEN_MISSION_TEMPLATES });
     }
 
     // --------------------------------------------------
@@ -1679,8 +1745,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       // GAME ACTIONS (pause, resume, next-turn, end, terminate, reset)
-      if (judgeAction === "POST /api/judge/game-action") {
-        const body = await readJson(req);
+      if (judgeAction === "POST /api/judge/game-action" || judgeAction === "POST /api/judge/game/reset") {
+        const body = (await readJson(req).catch(() => ({}))) || {};
+        if (judgeAction === "POST /api/judge/game/reset") {
+          body.action = "reset";
+          body.confirmed = true;
+        }
         const now = new Date().toISOString();
         if (body.action === "pause" && room.status === "running") {
           const settings = JSON.parse(room.settings || "{}");
@@ -1901,7 +1971,10 @@ const server = http.createServer(async (req, res) => {
 
       if (judgeAction === "POST /api/judge/logout") {
         const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-        if (token) judgeSessions.delete(token);
+        if (token) {
+          judgeSessions.delete(token);
+          removeSession(token);
+        }
         return sendJson(res, 200, { ok: true });
       }
     }

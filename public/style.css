@@ -537,23 +537,27 @@ td:first-child { font-weight: 600; color: #fff; }
   gap: 10px;
   margin: 12px 0 20px;
 }
-.record-card {
+.record-card,
+.record-item {
   padding: 14px 16px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: rgba(18, 11, 24, 0.5);
 }
-.record-heading {
+.record-heading,
+.record-header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 10px;
 }
-.record-heading strong {
+.record-heading strong,
+.record-header strong {
   color: #fff;
   font-size: 0.98rem;
 }
-.badge {
+.badge,
+.record-meta {
   padding: 3px 8px;
   border-radius: 999px;
   color: var(--gold);
@@ -724,19 +728,22 @@ td:first-child { font-weight: 600; color: #fff; }
   line-height: 1.6;
 }
 
-.rule-box {
+.rule-box,
+.rules-box {
   margin: 14px 0;
   padding: 16px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: rgba(18, 11, 23, 0.4);
 }
-.candidate-list {
+.candidate-list,
+.vote-candidates {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
 }
-.candidate {
+.candidate,
+.candidate-checkbox-label {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -747,10 +754,12 @@ td:first-child { font-weight: 600; color: #fff; }
   color: #fff;
   cursor: pointer;
 }
-.candidate input { width: auto; }
+.candidate input,
+.candidate-checkbox-label input { width: auto; }
 
 /* DIALOGS */
-.confirm-dialog {
+.confirm-dialog,
+.dialog {
   width: min(600px, calc(100% - 24px));
   max-height: 85vh;
   border: 1px solid var(--orange);
@@ -760,12 +769,49 @@ td:first-child { font-weight: 600; color: #fff; }
   background: var(--panel);
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
 }
-.confirm-dialog::backdrop {
+.confirm-dialog::backdrop,
+.dialog::backdrop {
   background: rgba(0, 0, 0, 0.8);
   backdrop-filter: blur(4px);
 }
-.dialog-inner {
+.dialog-inner,
+.dialog-content {
   padding: clamp(18px, 4vw, 26px);
+}
+
+/* OPERATIONS GRID & CARDS */
+.operations-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  margin-top: 14px;
+}
+
+.op-card {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(18, 11, 24, 0.55);
+}
+
+.btn-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.start-game-box {
+  margin-top: 24px;
+  padding: 18px;
+  border: 1px solid var(--orange);
+  border-radius: 12px;
+  background: rgba(242, 124, 56, 0.08);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
 }
 .confirmation-roster {
   display: grid;

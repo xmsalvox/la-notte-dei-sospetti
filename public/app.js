@@ -8,11 +8,11 @@ const confirmDialog = document.querySelector("#confirm-dialog");
 const proofDialog = document.querySelector("#proof-dialog");
 
 // Session State
-let userToken = sessionStorage.getItem("userToken");
-let judgeToken = sessionStorage.getItem("judgeToken");
-let playerToken = sessionStorage.getItem("playerToken");
-let currentRoomCode = sessionStorage.getItem("currentRoomCode");
-let currentUser = JSON.parse(sessionStorage.getItem("currentUser") || "null");
+let userToken = localStorage.getItem("userToken");
+let judgeToken = localStorage.getItem("judgeToken");
+let playerToken = localStorage.getItem("playerToken");
+let currentRoomCode = localStorage.getItem("currentRoomCode");
+let currentUser = JSON.parse(localStorage.getItem("currentUser") || "null");
 
 let state = null; // Current room judge state
 let toastTimeout;
@@ -49,7 +49,7 @@ async function api(url, options = {}, token = null) {
     if (response.status === 401) {
       if (token === playerToken) {
         playerToken = null;
-        sessionStorage.removeItem("playerToken");
+        localStorage.removeItem("playerToken");
         clearInterval(dashboardRefresh);
         showPlayerLoginView();
       }
@@ -157,6 +157,7 @@ async function loadPlayerDashboard() {
   if (!playerToken) return;
   try {
     const data = await api("/api/player/dashboard", {}, playerToken);
+    data.fetchedAt = Date.now();
     playerDashboard = data;
 
     if (data.waiting) {
@@ -169,9 +170,49 @@ async function loadPlayerDashboard() {
     document.querySelector("#player-waiting-room").hidden = true;
     document.querySelector("#player-role-panel").hidden = false;
     renderPlayerDashboard(data);
+    renderPlayerTimer();
   } catch (error) {
     showToast(error.message);
   }
+}
+
+function renderPlayerTimer() {
+  const el = document.querySelector("#player-timer");
+  if (!el || !playerDashboard || !playerDashboard.room) return;
+  const room = playerDashboard.room;
+
+  if (room.status === "setup") {
+    el.textContent = "In attesa";
+    return;
+  }
+  if (room.status === "completed" || room.status === "terminated") {
+    el.textContent = "Terminata";
+    return;
+  }
+  if (room.status === "paused") {
+    const rem = room.pausedRemainingMs ?? 0;
+    const totalSec = Math.max(0, Math.floor(rem / 1000));
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    el.textContent = `⏸ ${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return;
+  }
+  if (room.status === "running") {
+    const durationMs = (room.turnDurationMinutes || 30) * 60 * 1000;
+    const started = new Date(room.turnStartedAt).getTime();
+    if (isNaN(started)) {
+      el.textContent = "—";
+      return;
+    }
+    const elapsed = Date.now() - started;
+    const remainingMs = Math.max(0, durationMs - elapsed);
+    const totalSec = Math.floor(remainingMs / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    el.textContent = `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return;
+  }
+  el.textContent = "—";
 }
 
 function renderPlayerDashboard(data) {
@@ -294,6 +335,21 @@ function renderPlayerDashboard(data) {
     );
     msgList.append(rec);
     if (!isFromMe) notifList.append(rec.cloneNode(true));
+  }
+
+  // Badge Notifiche Missioni & Messaggi
+  const missionBadge = document.querySelector("#player-mission-badge");
+  if (missionBadge) {
+    const activeCount = (data.missions || []).filter((m) => ["assigned", "active"].includes(m.status)).length;
+    missionBadge.textContent = activeCount;
+    missionBadge.hidden = activeCount === 0;
+  }
+
+  const msgBadge = document.querySelector("#player-msg-badge");
+  if (msgBadge) {
+    const judgeMsgsCount = (data.messages || []).filter((m) => m.sender === "judge").length;
+    msgBadge.textContent = judgeMsgsCount;
+    msgBadge.hidden = judgeMsgsCount === 0;
   }
 
   // Azioni Speciali
@@ -602,7 +658,7 @@ function renderSupervisorRooms(rooms) {
 
 async function enterRoomAsJudge(roomCode) {
   currentRoomCode = roomCode;
-  sessionStorage.setItem("currentRoomCode", roomCode);
+  localStorage.setItem("currentRoomCode", roomCode);
   document.querySelector("#judge-auth-panel").hidden = true;
   document.querySelector("#judge-rooms-manager").hidden = true;
   document.querySelector("#judge-panel").hidden = false;
@@ -1044,6 +1100,25 @@ function renderJudgeOperations() {
   const running = game.status === "running";
   const paused = game.status === "paused";
 
+  // Scoreboard / Classifica attuale
+  const scoreboard = document.querySelector("#judge-scoreboard");
+  if (scoreboard) {
+    scoreboard.replaceChildren();
+    const sorted = [...(state.participants || [])].sort((a, b) => (b.score || 0) - (a.score || 0));
+    if (!sorted.length) {
+      const li = document.createElement("li");
+      li.textContent = "Nessun partecipante registrato.";
+      scoreboard.append(li);
+    } else {
+      for (const p of sorted) {
+        const li = document.createElement("li");
+        const roleLabel = p.role_name || p.role || "Nessun ruolo";
+        li.textContent = `${p.name} — ${p.score || 0} pt (${roleLabel})`;
+        scoreboard.append(li);
+      }
+    }
+  }
+
   document.querySelector("#pause-game").disabled = !running;
   document.querySelector("#resume-game").disabled = !paused;
   // FIX: consenti next-turn sia in running che in paused!
@@ -1089,6 +1164,47 @@ function renderJudgeOperations() {
     const isPlayer = msg.sender === "player";
     const title = isPlayer ? `💬 Da ${msg.participant_name}` : `📤 Inviato dal Giudice`;
     const rec = makeRecord(title, msg.body, new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }));
+
+    if (isPlayer && msg.kind === "report" && msg.status === "pending") {
+      const btnRow = document.createElement("div");
+      btnRow.className = "record-actions";
+      const approveBtn = document.createElement("button");
+      approveBtn.className = "button secondary";
+      approveBtn.textContent = "✓ Approva segnalazione";
+      approveBtn.addEventListener("click", () => reviewReport(msg.id, "approved"));
+
+      const rejectBtn = document.createElement("button");
+      rejectBtn.className = "button quiet";
+      rejectBtn.textContent = "✕ Respingi";
+      rejectBtn.addEventListener("click", () => reviewReport(msg.id, "rejected"));
+
+      btnRow.append(approveBtn, rejectBtn);
+      rec.append(btnRow);
+    }
+
+    if (isPlayer && msg.participant_id) {
+      const replyBtn = document.createElement("button");
+      replyBtn.className = "button quiet";
+      replyBtn.style.marginTop = "6px";
+      replyBtn.textContent = "✉️ Rispondi in privato";
+      replyBtn.addEventListener("click", async () => {
+        const text = window.prompt(`Rispondi privatamente a ${msg.participant_name}:`);
+        if (!text?.trim()) return;
+        try {
+          const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/messages` : "/api/judge/messages";
+          await api(url, {
+            method: "POST",
+            body: JSON.stringify({ participantId: msg.participant_id, body: text.trim(), subject: "Risposta del Giudice" })
+          });
+          showToast("Risposta inviata con successo!");
+          await loadJudgeState();
+        } catch (err) {
+          showToast(err.message);
+        }
+      });
+      rec.append(replyBtn);
+    }
+
     messageList.append(rec);
   }
 
@@ -1163,6 +1279,20 @@ async function reviewMission(missionId, status) {
     await api(url, { method: "PATCH", body: JSON.stringify({ status, reviewNote: note }) });
     await loadJudgeState();
     showToast("Verifica missione registrata.");
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+async function reviewReport(messageId, status) {
+  const note = status === "rejected" ? (window.prompt("Motivo del rifiuto (opzionale):") || "") : "";
+  try {
+    const url = currentRoomCode
+      ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/messages/${encodeURIComponent(messageId)}`
+      : `/api/judge/messages/${encodeURIComponent(messageId)}`;
+    await api(url, { method: "PATCH", body: JSON.stringify({ status, note }) });
+    showToast("Segnalazione valutata con successo.");
+    await loadJudgeState();
   } catch (err) {
     showToast(err.message);
   }
@@ -1301,7 +1431,7 @@ document.querySelector("#player-room-join-form")?.addEventListener("submit", asy
     }, null);
 
     playerToken = result.token;
-    sessionStorage.setItem("playerToken", playerToken);
+    localStorage.setItem("playerToken", playerToken);
     await loadPlayerDashboard();
     startPlayerPolling();
   } catch (err) {
@@ -1326,7 +1456,7 @@ document.querySelector("#player-login-form")?.addEventListener("submit", async (
       body: JSON.stringify({ code }),
     }, null);
     playerToken = result.token;
-    sessionStorage.setItem("playerToken", playerToken);
+    localStorage.setItem("playerToken", playerToken);
     await loadPlayerDashboard();
     startPlayerPolling();
   } catch (err) {
@@ -1340,7 +1470,7 @@ document.querySelector("#waiting-leave-btn")?.addEventListener("click", async ()
     await api("/api/player/logout", { method: "POST" }, playerToken);
   } catch {}
   playerToken = null;
-  sessionStorage.removeItem("playerToken");
+  localStorage.removeItem("playerToken");
   clearInterval(dashboardRefresh);
   showPlayerLoginView();
   showToast("Sei uscito dalla stanza.");
@@ -1351,7 +1481,7 @@ document.querySelector("#player-logout")?.addEventListener("click", async () => 
     await api("/api/player/logout", { method: "POST" }, playerToken);
   } catch {}
   playerToken = null;
-  sessionStorage.removeItem("playerToken");
+  localStorage.removeItem("playerToken");
   clearInterval(dashboardRefresh);
   showPlayerLoginView();
   showToast("Disconnesso dal profilo giocatore.");
@@ -1458,8 +1588,8 @@ document.querySelector("#judge-user-login-form")?.addEventListener("submit", asy
     }, null);
     userToken = res.token;
     currentUser = res.user;
-    sessionStorage.setItem("userToken", userToken);
-    sessionStorage.setItem("currentUser", JSON.stringify(currentUser));
+    localStorage.setItem("userToken", userToken);
+    localStorage.setItem("currentUser", JSON.stringify(currentUser));
     showJudgeRoomsView();
     showToast(`Benvenuto, ${currentUser.username}!`);
   } catch (err) {
@@ -1481,8 +1611,8 @@ document.querySelector("#judge-user-register-form")?.addEventListener("submit", 
     }, null);
     userToken = res.token;
     currentUser = res.user;
-    sessionStorage.setItem("userToken", userToken);
-    sessionStorage.setItem("currentUser", JSON.stringify(currentUser));
+    localStorage.setItem("userToken", userToken);
+    localStorage.setItem("currentUser", JSON.stringify(currentUser));
     showJudgeRoomsView();
     showToast("Profilo Game Master creato con successo!");
   } catch (err) {
@@ -1502,7 +1632,7 @@ document.querySelector("#judge-login-form")?.addEventListener("submit", async (e
       body: JSON.stringify({ password }),
     }, null);
     judgeToken = res.token;
-    sessionStorage.setItem("judgeToken", judgeToken);
+    localStorage.setItem("judgeToken", judgeToken);
     document.querySelector("#judge-auth-panel").hidden = true;
     document.querySelector("#judge-rooms-manager").hidden = true;
     document.querySelector("#judge-panel").hidden = false;
@@ -1515,25 +1645,27 @@ document.querySelector("#judge-login-form")?.addEventListener("submit", async (e
 
 // GM Logout
 document.querySelector("#judge-user-logout")?.addEventListener("click", async () => {
+  if (!window.confirm("Vuoi disconnetterti dal tuo account Master? Le tue stanze rimarranno salvate e attive.")) return;
   try { await api("/api/auth/logout", { method: "POST" }); } catch {}
   userToken = null;
   currentUser = null;
-  sessionStorage.removeItem("userToken");
-  sessionStorage.removeItem("currentUser");
+  judgeToken = null;
+  currentRoomCode = null;
+  localStorage.removeItem("userToken");
+  localStorage.removeItem("currentUser");
+  localStorage.removeItem("judgeToken");
+  localStorage.removeItem("currentRoomCode");
+  clearInterval(judgeRefresh);
   showJudgeAuthView();
-  showToast("Disconnesso dal profilo Game Master.");
+  showToast("Disconnesso dal profilo Game Master. Tutte le tue stanze restano salvate.");
 });
 
-document.querySelector("#judge-logout")?.addEventListener("click", async () => {
-  try { await api("/api/judge/logout", { method: "POST" }); } catch {}
-  judgeToken = null;
-  sessionStorage.removeItem("judgeToken");
+document.querySelector("#judge-logout")?.addEventListener("click", () => {
   clearInterval(judgeRefresh);
-  if (userToken) {
-    showJudgeRoomsView();
-  } else {
-    showJudgeAuthView();
-  }
+  currentRoomCode = null;
+  localStorage.removeItem("currentRoomCode");
+  showJudgeRoomsView();
+  showToast("Sei uscito dalla regia. La stanza rimane attiva per i giocatori.");
 });
 
 // Create Room Form
@@ -1559,7 +1691,7 @@ document.querySelector("#create-room-form")?.addEventListener("submit", async (e
 document.querySelector("#judge-back-to-rooms")?.addEventListener("click", () => {
   clearInterval(judgeRefresh);
   currentRoomCode = null;
-  sessionStorage.removeItem("currentRoomCode");
+  localStorage.removeItem("currentRoomCode");
   showJudgeRoomsView();
 });
 
@@ -1602,7 +1734,7 @@ document.querySelector("#supervisor-search-input")?.addEventListener("input", (e
 document.querySelector("#supervisor-back-btn")?.addEventListener("click", () => {
   clearInterval(judgeRefresh);
   currentRoomCode = null;
-  sessionStorage.removeItem("currentRoomCode");
+  localStorage.removeItem("currentRoomCode");
   document.querySelector("#supervisor-back-btn").hidden = true;
   document.querySelector("#judge-back-to-rooms").hidden = false;
   showJudgeRoomsView();
@@ -2041,6 +2173,7 @@ document.querySelector("#judge-new-game-btn")?.addEventListener("click", async (
 
 // Timers
 setInterval(renderJudgeTimer, 1000);
+setInterval(renderPlayerTimer, 1000);
 
 // Auto-init on page load
 if (playerToken) {
@@ -2049,16 +2182,30 @@ if (playerToken) {
     startPlayerPolling();
   }).catch(() => {
     playerToken = null;
-    sessionStorage.removeItem("playerToken");
+    localStorage.removeItem("playerToken");
   });
 }
 
 if (userToken) {
-  if (currentRoomCode) {
-    enterRoomAsJudge(currentRoomCode);
-  } else {
-    showJudgeRoomsView();
-  }
+  api("/api/auth/me", {}, userToken)
+    .then((res) => {
+      currentUser = res.user;
+      localStorage.setItem("currentUser", JSON.stringify(currentUser));
+      if (currentRoomCode) {
+        enterRoomAsJudge(currentRoomCode);
+      } else {
+        showJudgeRoomsView();
+      }
+    })
+    .catch(() => {
+      userToken = null;
+      currentUser = null;
+      currentRoomCode = null;
+      localStorage.removeItem("userToken");
+      localStorage.removeItem("currentUser");
+      localStorage.removeItem("currentRoomCode");
+      showJudgeAuthView();
+    });
 } else if (judgeToken) {
-  enterRoomAsJudge("H4LL0");
+  enterRoomAsJudge(currentRoomCode || "H4LL0");
 }
