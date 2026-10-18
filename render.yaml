@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: la-notte-dei-sospetti
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: JUDGE_PASSWORD
+        generateValue: true

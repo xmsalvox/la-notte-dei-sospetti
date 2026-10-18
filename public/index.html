@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#130d1b">
+  <title>La Notte dei Sospetti — Halloween Mystery Game</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="moon" aria-hidden="true">☾</div>
+      <p class="eyebrow">🎃 Gioco Investigativo · Notte di Halloween</p>
+      <h1>La Notte <span>dei Sospetti</span></h1>
+      <p class="intro">Una stanza. Quanti sospetti? Nessuna fiducia. Chi riuscirà a compiere la propria missione nell’ombra?</p>
+    </header>
+
+    <nav class="tabs main-tabs" aria-label="Modalità di accesso">
+      <button id="tab-player-btn" class="tab active" data-view="player-view">👤 Accedi come giocatore</button>
+      <button id="tab-judge-btn" class="tab" data-view="judge-view">⚖️ Accedi come giudice</button>
+    </nav>
+
+    <!-- AREA DEL GIUDICE -->
+    <section id="judge-view" class="view" hidden>
+      <div id="login-panel" class="panel login-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">ACCESSO RISERVATO</p>
+            <h2>Il Giudice</h2>
+          </div>
+          <span class="seal" aria-hidden="true">⚖️</span>
+        </div>
+        <p>Accesso protetto riservato al regista della partita. La password del giudice è mostrata nella console del server.</p>
+        <form id="judge-login-form" class="inline-form">
+          <label class="sr-only" for="judge-password">Password giudice</label>
+          <input id="judge-password" type="password" autocomplete="current-password" placeholder="Inserisci la password del giudice" required>
+          <button class="button primary" type="submit">Entra nella regia</button>
+        </form>
+        <p id="judge-login-error" class="error" role="alert"></p>
+      </div>
+
+      <div id="judge-panel" hidden>
+        <div class="panel welcome-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">REGIA DELLA PARTITA</p>
+              <h2>Pannello del Giudice</h2>
+            </div>
+            <div class="header-actions">
+              <button id="judge-refresh-btn" class="button secondary" type="button" title="Aggiorna dati in tempo reale">🔄 Aggiorna</button>
+              <button id="judge-new-game-btn" class="button quiet" type="button" title="Azzera la partita e riparti da zero">🔄 Nuova Partita</button>
+              <button id="judge-logout" class="button quiet" type="button">Esci</button>
+            </div>
+          </div>
+          <p>Configura partecipanti e ruoli segreti. Durante la partita gestisci turni, missioni, voti e segnalazioni.</p>
+          <div class="status-line">
+            <span class="status-dot"></span>
+            <span id="game-status">Partita non iniziata</span>
+          </div>
+          <div id="join-address-panel" class="join-address-panel" hidden>
+            <strong>🌐 Collegamento per i partecipanti sulla stessa rete Wi-Fi:</strong>
+            <ul id="join-address-list"></ul>
+            <p class="muted">Comunica questo indirizzo ai giocatori. Ciascuno userà il proprio codice privato per visualizzare il proprio ruolo.</p>
+          </div>
+        </div>
+
+        <!-- FASE 1: PARTECIPANTI (GAME MASTER) -->
+        <section class="panel" aria-labelledby="participants-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">FASE 1 · REGIA PARTECIPANTI</p>
+              <h2 id="participants-title">I Partecipanti della Partita</h2>
+            </div>
+            <div class="counter"><strong id="participant-count">0</strong><span>presenti</span></div>
+          </div>
+          <p class="section-copy">Decidi tu quanti partecipanti ci saranno e chi sono. Inserisci i nomi uno a uno:</p>
+          <div class="master-toolbar">
+            <form id="add-participant-form" class="inline-form" style="flex:1;">
+              <label class="sr-only" for="new-participant">Nome partecipante</label>
+              <input id="new-participant" type="text" maxlength="60" placeholder="Nome del partecipante (es. Marco, Sara...)" required>
+              <button class="button secondary" type="submit">+ Aggiungi</button>
+            </form>
+            <button id="clear-participants-btn" class="button quiet" type="button" title="Rimuovi tutti i partecipanti inseriti">🗑️ Svuota partecipanti</button>
+          </div>
+          <p id="roster-message" class="notice" role="status"></p>
+          <ol id="participant-list" class="participant-list"></ol>
+          <p id="empty-roster" class="empty-state">Nessun partecipante inserito. Aggiungi i nomi dei presenti per iniziare la preparazione.</p>
+        </section>
+
+        <!-- FASE 2: GESTIONE RUOLI (GAME MASTER) -->
+        <section class="panel" aria-labelledby="roles-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">FASE 2 · REGIA RUOLI</p>
+              <h2 id="roles-title">I Ruoli della Partita</h2>
+            </div>
+            <span class="lock" aria-label="Riservato">👑 Master</span>
+          </div>
+          <p class="section-copy">
+            In quanto Game Master, decidi tu liberamente <strong>quali ruoli esistono</strong>, i loro <strong>poteri</strong> e <strong>quanti giocatori</strong> avranno ciascun ruolo.
+          </p>
+
+          <div class="master-toolbar" style="margin-bottom:16px;">
+            <button id="clear-roles-btn" class="button quiet" type="button">🗑️ Azzera tutti i ruoli (Parti da zero)</button>
+            <button id="preset-roles-btn" class="button secondary" type="button">✨ Carica preset classico Halloween</button>
+          </div>
+
+          <!-- FORM CREAZIONE / MODIFICA RUOLO -->
+          <div class="role-creator-box">
+            <h3 id="role-form-title">➕ Crea un Ruolo per la tua partita</h3>
+            <form id="role-editor-form" class="form-grid">
+              <input id="role-edit-id" type="hidden">
+              <label>Nome del ruolo<input id="role-edit-name" maxlength="60" required placeholder="Es. Detective, Assassino, Fantasma..."></label>
+              <label>Giocatori con questo ruolo (Quantità)<input id="role-edit-count" type="number" min="0" step="1" value="1" required></label>
+              <label class="wide">Squadra o fazione<input id="role-edit-team" maxlength="60" placeholder="Es. Investigatori, Sabotatori, Neutrale..."></label>
+              <label class="wide">Descrizione del ruolo e poteri segreti<textarea id="role-edit-description" rows="2" placeholder="Cosa sa e cosa può fare questo ruolo"></textarea></label>
+              <label class="wide">Obiettivo di vittoria<textarea id="role-edit-objectives" rows="2" placeholder="Come vince (es. Eliminare tutti i colpevoli)"></textarea></label>
+              <label class="wide">Regole e limitazioni<textarea id="role-edit-rules" rows="2" placeholder="Regole speciali da rispettare"></textarea></label>
+              <label class="wide">Azioni speciali consentite (una per riga)<textarea id="role-edit-actions" rows="2" placeholder="Es. Indaga un sospetto&#10;Proteggi una stanza&#10;Furtivo"></textarea></label>
+              <div class="form-actions wide">
+                <button id="role-save-btn" class="button secondary" type="submit">+ Salva Ruolo</button>
+                <button id="role-cancel-edit-btn" class="button quiet" type="button" hidden>Annulla modifica</button>
+                <button id="role-delete" class="button quiet" type="button" hidden>🗑️ Elimina ruolo</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- REGOLAZIONE QUANTITÀ RUOLI ESISTENTI -->
+          <div style="margin-top:20px;">
+            <h3>Ruoli attualmente configurati nella partita</h3>
+            <form id="role-configuration-form" class="role-configuration">
+              <div id="role-target-list" class="role-target-list"></div>
+              <div class="role-config-footer">
+                <p id="role-configuration-total" class="muted"></p>
+                <button id="save-role-configuration" class="button secondary" type="submit">Salva quantità ruoli</button>
+              </div>
+            </form>
+            <p id="role-configuration-message" class="notice" role="status"></p>
+          </div>
+
+          <!-- ASSEGNAZIONE MANUALE -->
+          <h3 style="margin-top:24px;">Assegnazione Manuale dei Ruoli ai Partecipanti</h3>
+          <p class="section-copy">Assegna personalmente ciascun ruolo tramite il menu a tendina. I contatori si aggiornano in tempo reale:</p>
+          <div id="role-counts" class="role-counts"></div>
+          <div id="validation" class="validation" role="status"></div>
+
+          <!-- Tabella assegnazione manuale con menu a tendina -->
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Partecipante</th>
+                  <th scope="col">Ruolo assegnato (dal giudice)</th>
+                  <th scope="col">Codice privato giocatore</th>
+                  <th scope="col">Stato connessione</th>
+                </tr>
+              </thead>
+              <tbody id="role-table-body"></tbody>
+            </table>
+          </div>
+          <div class="team-note">
+            <span>✦</span>
+            <span>Distribuzione squadre: <strong id="team-count">Calcolo in corso...</strong></span>
+          </div>
+        </section>
+
+        <!-- CONFIGURAZIONE PARTITA E REGOLE -->
+        <section class="panel" aria-labelledby="settings-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">REGOLE E TURNI</p>
+              <h2 id="settings-title">Configurazione della partita</h2>
+            </div>
+          </div>
+          <form id="settings-form" class="form-grid">
+            <label>Numero di turni<input id="setting-turn-count" type="number" min="1" max="100" step="1" value="1" required></label>
+            <label>Durata turno (minuti)<input id="setting-turn-duration" type="number" min="1" max="1440" step="1" value="30" required></label>
+            <label>Massimo sospetti per voto<input id="setting-vote-limit" type="number" min="1" max="100" step="1" value="1" required></label>
+            <label>Criterio classifica
+              <select id="setting-win-metric">
+                <option value="score">Punteggio squadra</option>
+                <option value="missions">Missioni completate</option>
+                <option value="votes">Voti ricevuti</option>
+              </select>
+            </label>
+            <label class="wide">Regole aggiuntive della partita<textarea id="setting-rules" rows="3" placeholder="Regole speciali comunicate a tutti i giocatori"></textarea></label>
+            <label class="wide">Condizioni di vittoria<textarea id="setting-win-conditions" rows="3" placeholder="Come vince ciascuna fazione"></textarea></label>
+            <label class="checkbox-label wide"><input id="setting-deadline-failure" type="checkbox"> La scadenza del timer fa fallire automaticamente le missioni non completate</label>
+            <div class="wide">
+              <button id="save-settings" class="button secondary" type="submit">Salva impostazioni partita</button>
+            </div>
+          </form>
+          <p id="settings-message" class="notice" role="status"></p>
+        </section>
+
+        <!-- CONTROLLO E REGIA PARTITA -->
+        <section id="game-controls" class="panel" aria-labelledby="controls-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">REGIA OPERATIVA</p>
+              <h2 id="controls-title">Controllo della partita</h2>
+            </div>
+          </div>
+          <p id="judge-game-summary" class="status-line"></p>
+          <p id="judge-timer" class="timer"></p>
+          <div class="button-row">
+            <button id="pause-game" class="button secondary" type="button">⏸️ Metti in pausa</button>
+            <button id="resume-game" class="button secondary" type="button">▶️ Riprendi turno</button>
+            <button id="next-turn" class="button secondary" type="button">⏭️ Turno successivo</button>
+            <button id="end-game" class="button primary" type="button">🛑 Concludi partita</button>
+            <button id="terminate-game" class="button quiet" type="button">Annulla senza rivelare</button>
+            <button id="reveal-roles" class="button secondary" type="button">🎭 Rivela i ruoli finali</button>
+          </div>
+
+          <div class="two-column">
+            <!-- ASSEGNA MISSIONE -->
+            <form id="mission-form" class="form-grid">
+              <h3 class="wide">📜 Assegna missione</h3>
+              <label>Assegna a
+                <select id="mission-target-type">
+                  <option value="player">Un singolo partecipante</option>
+                  <option value="role">Tutti i membri di un ruolo</option>
+                </select>
+              </label>
+              <label id="mission-participant-field">Partecipante<select id="mission-participant" required></select></label>
+              <label id="mission-role-field" hidden>Ruolo destinatario<select id="mission-role"></select></label>
+              <label class="wide">Titolo missione<input id="mission-title" maxlength="120" required placeholder="Es. Furto del sigillo"></label>
+              <label class="wide">Descrizione<textarea id="mission-description" rows="2" placeholder="Dettagli operativi per il giocatore"></textarea></label>
+              <label>Obiettivo<textarea id="mission-objective" rows="2" placeholder="Cosa deve ottenere"></textarea></label>
+              <label>Regole e limiti<textarea id="mission-rules" rows="2" placeholder="Cosa non può fare"></textarea></label>
+              <label class="wide">Modalità di verifica<textarea id="mission-verification" rows="2" placeholder="Cosa deve inviare come prova (testo, codice, testimonianza)"></textarea></label>
+              <label>Punti previsti<input id="mission-score" type="number" min="0" step="1" value="10" required></label>
+              <label>Turno di validità<input id="mission-turn" type="number" min="1" step="1" value="1" required></label>
+              <div class="wide">
+                <button class="button secondary" type="submit">Assegna missione</button>
+              </div>
+            </form>
+
+            <!-- COMUNICAZIONI E VOTAZIONE -->
+            <div>
+              <form id="judge-message-form" class="form-grid">
+                <h3 class="wide">💬 Invia comunicazione</h3>
+                <label>Destinatari
+                  <select id="judge-message-target-type">
+                    <option value="all">Tutti i giocatori (Annuncio globale)</option>
+                    <option value="player">Un singolo partecipante (Privato)</option>
+                    <option value="team">Un gruppo/squadra</option>
+                  </select>
+                </label>
+                <label id="message-participant-field" hidden>Partecipante<select id="message-participant"></select></label>
+                <label id="message-team-field" hidden>Gruppo<select id="message-team"></select></label>
+                <label class="wide">Oggetto<input id="message-subject" maxlength="120" placeholder="Es. Comunicato urgente"></label>
+                <label class="wide">Messaggio<textarea id="judge-message-body" rows="3" required maxlength="5000" placeholder="Scrivi il testo da inviare..."></textarea></label>
+                <div class="wide">
+                  <button class="button secondary" type="submit">Invia comunicazione</button>
+                </div>
+              </form>
+
+              <div class="panel-section">
+                <h3>🗳️ Gestione votazione finale</h3>
+                <form id="vote-open-form" class="inline-form">
+                  <label class="sr-only" for="vote-limit">Massimo voti</label>
+                  <input id="vote-limit" type="number" min="1" step="1" value="1" required title="Massimo sospetti selezionabili da ogni giocatore">
+                  <button class="button secondary" type="submit">Apri votazione</button>
+                  <button id="vote-close" class="button quiet" type="button">Chiudi votazione</button>
+                </form>
+                <div id="judge-vote-results" class="record-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- LISTE RECORD GIUDICE -->
+          <h3>📜 Missioni e verifiche prove</h3>
+          <div id="judge-missions" class="record-list"></div>
+
+          <h3>💬 Segnalazioni, domande e messaggi</h3>
+          <div id="judge-messages" class="record-list"></div>
+
+          <h3>🗡️ Azioni segrete dei ruoli da valutare</h3>
+          <div id="judge-actions" class="record-list"></div>
+
+          <h3>⭐ Classifica e correzione punteggi</h3>
+          <form id="score-adjustment-form" class="inline-form">
+            <label>Giocatore<select id="score-participant" required></select></label>
+            <label>Punti (+ o -)<input id="score-points" type="number" min="-100000" max="100000" step="1" required placeholder="Es. +5 o -3"></label>
+            <label>Motivazione obbligatoria<input id="score-reason" maxlength="500" required placeholder="Motivo della correzione"></label>
+            <button class="button secondary" type="submit">Registra punteggio</button>
+          </form>
+          <ol id="judge-scoreboard" class="scoreboard"></ol>
+
+          <h3>📋 Registro storico delle decisioni</h3>
+          <ol id="audit-log" class="history-list"></ol>
+        </section>
+
+        <!-- FASE 3: AVVIO PARTITA -->
+        <section class="panel launch-panel" aria-labelledby="launch-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">FASE 3 · CONTROLLO FINALE</p>
+              <h2 id="launch-title">Inizia la partita</h2>
+            </div>
+          </div>
+          <p class="section-copy">Prima dell’avvio verificherai il riepilogo segreto completo di tutti i partecipanti e ruoli. Dopo la conferma, i ruoli saranno distribuiti ai giocatori e bloccati.</p>
+          <button id="start-game" class="button primary launch-button" type="button" disabled>Inizia la Notte dei Sospetti</button>
+          <p id="start-hint" class="muted">Completa le assegnazioni dei partecipanti per abilitare l’avvio.</p>
+        </section>
+
+        <!-- STORICO MODIFICHE ECCEZIONALI -->
+        <section id="history-panel" class="panel" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">TRACCIABILITÀ</p>
+              <h2>Storico modifiche eccezionali</h2>
+            </div>
+          </div>
+          <ol id="history-list" class="history-list"></ol>
+        </section>
+      </div>
+    </section>
+
+    <!-- AREA PERSONALE DEL GIOCATORE -->
+    <section id="player-view" class="view">
+      <div class="panel player-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">ACCESSO PERSONALE</p>
+            <h2>Il Mio Profilo</h2>
+          </div>
+          <span class="seal" aria-hidden="true">🎭</span>
+        </div>
+
+        <!-- LOGIN CON CODICE PRIVATO -->
+        <div id="player-login-panel">
+          <p>Inserisci il codice personale che ti è stato consegnato dal giudice. Ti darà accesso al tuo ruolo segreto e alle tue missioni.</p>
+          <form id="player-login-form" class="inline-form">
+            <label class="sr-only" for="player-code">Codice privato</label>
+            <input id="player-code" type="password" autocomplete="off" placeholder="Incolla qui il tuo codice privato" required>
+            <button class="button primary" type="submit">Entra nel gioco</button>
+          </form>
+          <p id="player-login-error" class="error" role="alert"></p>
+        </div>
+
+        <!-- DASHBOARD NAVIGABILE DEL GIOCATORE -->
+        <div id="player-role-panel" hidden>
+          <!-- Header Giocatore -->
+          <div class="player-header-bar">
+            <div>
+              <span class="player-greeting">Bentornato,</span>
+              <strong id="player-name" class="player-name">...</strong>
+            </div>
+            <button id="player-logout" class="button quiet" type="button">Esci</button>
+          </div>
+
+          <!-- Sottomenu navigazione interna (Prompt 2) -->
+          <nav class="player-subtabs" aria-label="Sezioni del giocatore">
+            <button class="player-subtab active" data-subview="subview-home">🏠 Home</button>
+            <button class="player-subtab" data-subview="subview-role">🎭 Ruolo</button>
+            <button class="player-subtab" data-subview="subview-missions">📜 Missioni <span id="player-mission-badge" class="subtab-badge" hidden>0</span></button>
+            <button class="player-subtab" data-subview="subview-actions">🗡️ Azioni</button>
+            <button class="player-subtab" data-subview="subview-messages">💬 Messaggi <span id="player-msg-badge" class="subtab-badge" hidden>0</span></button>
+            <button class="player-subtab" data-subview="subview-score">⭐ Punti</button>
+            <button class="player-subtab" data-subview="subview-rules">📖 Regole</button>
+            <button id="player-voting-tab-btn" class="player-subtab" data-subview="subview-voting" hidden>🗳️ Vota</button>
+            <button id="player-results-tab-btn" class="player-subtab" data-subview="subview-results" hidden>🏆 Esito</button>
+          </nav>
+
+          <!-- SEZIONE A: HOME PERSONALE -->
+          <div id="subview-home" class="player-subview">
+            <div class="role-reveal">
+              <span>Il tuo ruolo segreto</span>
+              <strong id="player-role">...</strong>
+            </div>
+            <div class="player-summary-cards">
+              <div class="summary-card">
+                <span class="card-label">Squadra</span>
+                <strong id="player-team" class="card-value">—</strong>
+              </div>
+              <div class="summary-card">
+                <span class="card-label">Punteggio personale</span>
+                <strong id="player-score" class="card-value highlight-score">0 punti</strong>
+              </div>
+              <div class="summary-card">
+                <span class="card-label">Turno attuale</span>
+                <strong id="player-game-status" class="card-value">—</strong>
+              </div>
+              <div class="summary-card">
+                <span class="card-label">Tempo turno</span>
+                <strong id="player-timer" class="card-value timer-small">—</strong>
+              </div>
+            </div>
+
+            <!-- Missione attiva in primo piano -->
+            <div class="panel-section">
+              <h3>📜 La tua missione attiva</h3>
+              <div id="player-active-mission-card">
+                <p class="empty-state">Nessuna missione in corso al momento.</p>
+              </div>
+            </div>
+
+            <!-- Ultime comunicazioni del giudice -->
+            <div class="panel-section">
+              <h3>📢 Ultime comunicazioni dal Giudice</h3>
+              <div id="player-home-notifications" class="record-list"></div>
+            </div>
+          </div>
+
+          <!-- SEZIONE B: IL MIO RUOLO -->
+          <div id="subview-role" class="player-subview" hidden>
+            <div class="role-reveal">
+              <span>Identità</span>
+              <strong id="player-role-detail">...</strong>
+            </div>
+            <div class="panel-section">
+              <h3>Istruzioni riservate</h3>
+              <div id="player-instructions"></div>
+              <p id="player-allies" class="team-note"></p>
+            </div>
+          </div>
+
+          <!-- SEZIONE C: LE MIE MISSIONI -->
+          <div id="subview-missions" class="player-subview" hidden>
+            <div class="panel-section">
+              <div class="section-title-row">
+                <h3>Le tue missioni</h3>
+                <span class="muted">Invia prove e consulta le verifiche</span>
+              </div>
+              <div id="player-missions" class="record-list"></div>
+            </div>
+          </div>
+
+          <!-- SEZIONE D: AZIONI SEGRETE -->
+          <div id="subview-actions" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>Azioni speciali del tuo ruolo</h3>
+              <p class="section-copy">Compi azioni riservate previste dal tuo ruolo. Il giudice le valuterà in segreto assegnando eventuali punti.</p>
+              <form id="player-action-form" class="form-grid">
+                <label class="wide">Azione consentita
+                  <select id="player-action-title" required></select>
+                </label>
+                <label class="wide">Dettagli sull'azione svolta
+                  <textarea id="player-action-details" rows="3" maxlength="5000" placeholder="Descrivi cosa hai fatto, su chi o in quale stanza..."></textarea>
+                </label>
+                <div class="wide">
+                  <button class="button secondary" type="submit">Invia azione riservata</button>
+                </div>
+              </form>
+              <h4>Storico azioni inviate</h4>
+              <div id="player-actions" class="record-list"></div>
+            </div>
+          </div>
+
+          <!-- SEZIONE E: COMUNICAZIONI PRIVATE -->
+          <div id="subview-messages" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>Comunica in privato con il Giudice</h3>
+              <p class="section-copy">Invia segnalazioni su comportamenti sospetti o poni domande riservate sulle regole.</p>
+              <form id="player-message-form" class="form-grid">
+                <label>Tipo di messaggio
+                  <select id="player-message-kind">
+                    <option value="report">🚨 Segnalazione sospetto</option>
+                    <option value="message">💬 Domanda privata / Info</option>
+                  </select>
+                </label>
+                <label>Oggetto (opzionale)
+                  <input id="player-message-subject" maxlength="120" placeholder="Es. Ho visto qualcuno vicino allo studio">
+                </label>
+                <label class="wide">Messaggio
+                  <textarea id="player-message-body" rows="3" required maxlength="5000" placeholder="Scrivi al giudice in totale riservatezza..."></textarea>
+                </label>
+                <div class="wide">
+                  <button class="button secondary" type="submit">Invia al giudice</button>
+                </div>
+              </form>
+
+              <h4>Messaggi ricevuti e inviati</h4>
+              <div id="player-messages" class="record-list"></div>
+            </div>
+          </div>
+
+          <!-- SEZIONE F: PUNTEGGIO -->
+          <div id="subview-score" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>Il tuo Punteggio</h3>
+              <div class="score-spotlight">
+                <span class="spotlight-number" id="player-score-large">0</span>
+                <span class="spotlight-label">Punti totali accumulati</span>
+              </div>
+              <h4>Come guadagnare punti:</h4>
+              <ul class="score-guidelines">
+                <li>📜 <strong>Missioni completate:</strong> porta a termine gli obiettivi assegnati dal giudice.</li>
+                <li>🗡️ <strong>Azioni speciali:</strong> usa le capacità del tuo ruolo e invia il resoconto al giudice.</li>
+                <li>⚖️ <strong>Correzioni del giudice:</strong> bonus per intuizioni o gioco di ruolo eccellente.</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- SEZIONE G: REGOLE DEL GIOCO -->
+          <div id="subview-rules" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>Regole e condizioni di vittoria</h3>
+              <div class="rule-box">
+                <h4>📜 Regole della partita</h4>
+                <p id="player-rules">Nessuna regola aggiuntiva configurata.</p>
+              </div>
+              <div class="rule-box">
+                <h4>🏆 Condizioni di vittoria</h4>
+                <p id="player-win-conditions">Condizioni di vittoria non specificate.</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- SEZIONE H: VOTAZIONE SOSPETTI -->
+          <div id="subview-voting" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>🗳️ Votazione dei Sospetti</h3>
+              <p class="section-copy">Seleziona chi ritieni colpevole. Le preferenze restano assolutamente private e non saranno rivelate fino alla fine.</p>
+              <form id="player-vote-form" class="form-grid">
+                <div id="vote-candidates" class="candidate-list wide"></div>
+                <div class="wide">
+                  <button class="button primary" type="submit">Conferma e invia il voto</button>
+                </div>
+              </form>
+              <p id="vote-confirmation" class="notice" role="status"></p>
+            </div>
+          </div>
+
+          <!-- SEZIONE I: ESITO FINALE -->
+          <div id="subview-results" class="player-subview" hidden>
+            <div class="panel-section">
+              <h3>🏆 Esito finale della Notte</h3>
+              <p id="final-summary" class="status-line"></p>
+              <h4>Squadre</h4>
+              <div id="final-teams" class="record-list"></div>
+              <h4>Rivelazione di tutti i giocatori e ruoli</h4>
+              <ol id="final-results" class="scoreboard"></ol>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>✦</span> La Notte dei Sospetti · Halloween Party Game <span>✦</span>
+    </footer>
+  </main>
+
+  <!-- MODAL RIEPILOGO RISERVATO PRE-AVVIO -->
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <form method="dialog" class="dialog-inner">
+      <p class="eyebrow">ULTIMO CONTROLLO RISERVATO · SOLO GIUDICE</p>
+      <h2>Riepilogo Assegnazioni</h2>
+      <p>Verifica ciascuna assegnazione prima di procedere. I partecipanti non vedranno mai questo elenco completo.</p>
+      <ol id="confirmation-roster" class="confirmation-roster"></ol>
+      <div class="dialog-actions">
+        <button id="cancel-start" class="button quiet" value="cancel">Torna alle assegnazioni</button>
+        <button id="confirm-start" class="button primary" value="confirm">Conferma e avvia la partita</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- MODAL INVIO PROVA MISSIONE GIOCATORE -->
+  <dialog id="proof-dialog" class="confirm-dialog">
+    <form id="proof-form" class="dialog-inner">
+      <p class="eyebrow">RISULTATO DELLA MISSIONE</p>
+      <h2 id="proof-dialog-title">Invia prova missione</h2>
+      <p>Descrivi come hai completato la missione o incolla la prova testuale richiesta (testo, numeri, codice, o link/descrizione di foto e video):</p>
+      <input type="hidden" id="proof-mission-id">
+      <label class="sr-only" for="proof-text">Prova o risultato</label>
+      <textarea id="proof-text" rows="4" required placeholder="Inserisci qui il risultato, la testimonianza o i dettagli della prova..." style="width:100%;margin:10px 0;"></textarea>
+      <div class="dialog-actions">
+        <button id="cancel-proof-btn" class="button quiet" type="button">Annulla</button>
+        <button class="button primary" type="submit">Invia al giudice</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

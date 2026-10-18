@@ -1,0 +1,13 @@
+{
+  "name": "la-notte-dei-sospetti",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gestione locale della partita La Notte dei Sospetti",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
