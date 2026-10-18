@@ -10,7 +10,7 @@ const ROOT = __dirname;
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "game.sqlite");
 const JUDGE_PASSWORD_PATH = path.join(DATA_DIR, "judge-password.txt");
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -117,6 +117,7 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'assigned'
       CHECK (status IN ('assigned', 'active', 'submitted', 'under_review', 'completed', 'rejected')),
     proof TEXT NOT NULL DEFAULT '',
+    proof_attachment TEXT DEFAULT NULL,
     review_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     submitted_at TEXT,
@@ -131,6 +132,7 @@ db.exec(`
     kind TEXT NOT NULL CHECK (kind IN ('message', 'report', 'announcement')),
     subject TEXT NOT NULL DEFAULT '',
     body TEXT NOT NULL,
+    attachment TEXT DEFAULT NULL,
     team TEXT,
     created_at TEXT NOT NULL,
     read_at TEXT,
@@ -194,6 +196,12 @@ for (const table of ["participants", "role_history", "missions", "messages", "se
     }
     if (table === "participants" && !cols.has("pin")) {
       db.exec(`ALTER TABLE participants ADD COLUMN pin TEXT`);
+    }
+    if (table === "messages" && !cols.has("attachment")) {
+      db.exec(`ALTER TABLE messages ADD COLUMN attachment TEXT DEFAULT NULL`);
+    }
+    if (table === "missions" && !cols.has("proof_attachment")) {
+      db.exec(`ALTER TABLE missions ADD COLUMN proof_attachment TEXT DEFAULT NULL`);
     }
   }
 }
@@ -1214,7 +1222,7 @@ const server = http.createServer(async (req, res) => {
         WHERE m.room_id = ? AND (
           m.participant_id = ? OR 
           (m.sender = 'judge' AND m.participant_id IS NULL AND (m.team IS NULL OR m.team = ?))
-        ) ORDER BY m.created_at DESC LIMIT 50`).all(roomId, participant.id, role?.team || null);
+        ) ORDER BY m.created_at ASC LIMIT 100`).all(roomId, participant.id, role?.team || null);
       const actions = db.prepare("SELECT * FROM secret_actions WHERE participant_id = ? AND room_id = ? ORDER BY created_at DESC").all(participant.id, roomId);
       const settings = JSON.parse(room.settings || "{}");
       const candidates = db.prepare("SELECT id, name FROM participants WHERE room_id = ? AND id != ? ORDER BY name").all(roomId, participant.id);
@@ -1279,12 +1287,15 @@ const server = http.createServer(async (req, res) => {
       const messageText = String(body.body || "").trim();
       const subject = String(body.subject || "").trim().slice(0, 100);
       const kind = ["message", "report"].includes(body.kind) ? body.kind : "message";
-      if (!messageText) return sendJson(res, 400, { error: "Il messaggio non può essere vuoto." });
-      db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, status, created_at)
-        VALUES (?, ?, ?, 'player', ?, ?, ?, 'pending', ?)`).run(
-        crypto.randomUUID(), session.roomId, session.participantId, kind, subject, messageText, new Date().toISOString()
+      const attachment = body.attachment ? String(body.attachment) : null;
+      if (!messageText && !attachment) return sendJson(res, 400, { error: "Il messaggio o una foto è obbligatorio." });
+      const msgId = crypto.randomUUID();
+      db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, attachment, status, created_at)
+        VALUES (?, ?, ?, 'player', ?, ?, ?, ?, 'pending', ?)`).run(
+        msgId, session.roomId, session.participantId, kind, subject, messageText, attachment, new Date().toISOString()
       );
-      return sendJson(res, 201, { ok: true });
+      logAction(session.roomId, "player", "player_message", { kind, hasAttachment: Boolean(attachment) });
+      return sendJson(res, 201, { ok: true, id: msgId });
     }
 
     if (route === "POST /api/player/actions") {
@@ -1358,9 +1369,10 @@ const server = http.createServer(async (req, res) => {
         db.prepare("UPDATE missions SET status = 'active' WHERE id = ? AND status = 'assigned'").run(missionId);
       } else if (action === "submit") {
         const proof = String(body.proof || "").trim();
-        if (!proof) return sendJson(res, 400, { error: "Inserisci una prova o descrizione del completamento." });
-        db.prepare("UPDATE missions SET status = 'submitted', proof = ?, submitted_at = ? WHERE id = ?").run(
-          proof, new Date().toISOString(), missionId
+        const proofAttachment = body.proofAttachment ? String(body.proofAttachment) : null;
+        if (!proof && !proofAttachment) return sendJson(res, 400, { error: "Inserisci una prova o una foto del completamento." });
+        db.prepare("UPDATE missions SET status = 'submitted', proof = ?, proof_attachment = ?, submitted_at = ? WHERE id = ?").run(
+          proof, proofAttachment, new Date().toISOString(), missionId
         );
       }
       return sendJson(res, 200, { ok: true });
@@ -1884,12 +1896,14 @@ const server = http.createServer(async (req, res) => {
         const body = await readJson(req);
         const text = String(body.body || "").trim();
         const subject = String(body.subject || "").trim().slice(0, 100);
-        if (!text) return sendJson(res, 400, { error: "Il testo della comunicazione è obbligatorio." });
-        db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, team, status, created_at)
-          VALUES (?, ?, ?, 'judge', 'announcement', ?, ?, ?, 'sent', ?)`).run(
-          crypto.randomUUID(), room.id, body.participantId || null, subject, text, body.team || null, new Date().toISOString()
+        const attachment = body.attachment ? String(body.attachment) : null;
+        if (!text && !attachment) return sendJson(res, 400, { error: "Il testo della comunicazione o un allegato è obbligatorio." });
+        const kind = body.kind || "message";
+        db.prepare(`INSERT INTO messages (id, room_id, participant_id, sender, kind, subject, body, attachment, team, status, created_at)
+          VALUES (?, ?, ?, 'judge', ?, ?, ?, ?, ?, 'sent', ?)`).run(
+          crypto.randomUUID(), room.id, body.participantId || null, kind, subject, text, attachment, body.team || null, new Date().toISOString()
         );
-        logAction(room.id, "judge", "message_sent", { recipient: body.participantId ? "player" : body.team ? "team" : "all" });
+        logAction(room.id, "judge", "message_sent", { recipient: body.participantId ? "player" : body.team ? "team" : "all", hasAttachment: Boolean(attachment) });
         return sendJson(res, 201, { ok: true });
       }
 

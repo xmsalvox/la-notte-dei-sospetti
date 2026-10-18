@@ -22,6 +22,59 @@ let judgeRefresh;
 let spoilersHidden = false;
 let missionTemplates = [];
 
+// Chat & Media Upload State
+let playerChatAttachment = null;
+let judgeChatAttachment = null;
+let proofPhotoAttachment = null;
+let activeJudgeChatParticipantId = null; // null = Broadcast / All
+
+// Client-side image compressor (converts to lightweight JPEG base64 Data URL)
+async function compressImage(file, maxDimension = 1200, quality = 0.72) {
+  return new Promise((resolve, reject) => {
+    if (!file || !file.type.startsWith("image/")) {
+      return reject(new Error("Seleziona un file immagine valido (JPEG, PNG, WebP)."));
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Impossibile leggere il file immagine selezionato."));
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Errore durante l'apertura dell'immagine."));
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL("image/jpeg", quality);
+        resolve(dataUrl);
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function openLightbox(imgSrc, caption = "") {
+  const dialog = document.querySelector("#image-lightbox-dialog");
+  const img = document.querySelector("#lightbox-img");
+  const cap = document.querySelector("#lightbox-caption");
+  if (!dialog || !img) return;
+  img.src = imgSrc;
+  if (cap) cap.textContent = caption || "";
+  dialog.showModal();
+}
+
 // ----------------------------------------------------
 // UTILITIES & API
 // ----------------------------------------------------
@@ -324,8 +377,8 @@ function renderPlayerDashboard(data) {
   // Notifiche Home & Messaggi
   const notifList = document.querySelector("#player-home-notifications");
   const msgList = document.querySelector("#player-messages");
-  notifList.replaceChildren();
-  msgList.replaceChildren();
+  if (notifList) notifList.replaceChildren();
+  if (msgList) msgList.replaceChildren();
   for (const msg of data.messages) {
     const isFromMe = msg.sender === "player";
     const rec = makeRecord(
@@ -333,9 +386,10 @@ function renderPlayerDashboard(data) {
       msg.body,
       new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })
     );
-    msgList.append(rec);
-    if (!isFromMe) notifList.append(rec.cloneNode(true));
+    if (msgList) msgList.append(rec);
+    if (!isFromMe && notifList) notifList.append(rec.cloneNode(true));
   }
+  renderPlayerChat(data.messages, data.participant);
 
   // Badge Notifiche Missioni & Messaggi
   const missionBadge = document.querySelector("#player-mission-badge");
@@ -408,6 +462,74 @@ function renderPlayerDashboard(data) {
   }
 }
 
+function renderPlayerChat(messages, currentParticipant) {
+  const bubblesArea = document.querySelector("#player-chat-bubbles");
+  if (!bubblesArea) return;
+  bubblesArea.replaceChildren();
+
+  const notice = document.createElement("div");
+  notice.className = "chat-system-notice";
+  notice.textContent = "Benvenuto nel canale riservato. Tutto ciò che scrivi è visibile solo al Game Master.";
+  bubblesArea.append(notice);
+
+  const sorted = [...(messages || [])].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+  for (const msg of sorted) {
+    const isFromMe = msg.sender === "player";
+    const isBroadcast = msg.participant_id === null;
+
+    if (isBroadcast && !isFromMe) {
+      const bCast = document.createElement("div");
+      bCast.className = "chat-bubble chat-bubble-system";
+      bCast.textContent = `📢 Annuncio Globale del Master: ${msg.body}`;
+      if (msg.attachment) {
+        const img = document.createElement("img");
+        img.className = "chat-bubble-img";
+        img.src = msg.attachment;
+        img.alt = "Allegato annuncio";
+        img.addEventListener("click", () => openLightbox(msg.attachment, "Annuncio Globale Master"));
+        bCast.append(img);
+      }
+      bubblesArea.append(bCast);
+      continue;
+    }
+
+    const bubble = document.createElement("div");
+    bubble.className = `chat-bubble ${isFromMe ? "chat-bubble-me" : "chat-bubble-other"}`;
+
+    const sender = document.createElement("div");
+    sender.className = "chat-bubble-sender";
+    sender.textContent = isFromMe ? "Tu" : "Game Master";
+    bubble.append(sender);
+
+    if (msg.body) {
+      const text = document.createElement("div");
+      text.textContent = msg.body;
+      bubble.append(text);
+    }
+
+    if (msg.attachment) {
+      const img = document.createElement("img");
+      img.className = "chat-bubble-img";
+      img.src = msg.attachment;
+      img.alt = "Foto allegata";
+      img.title = "Clicca per ingrandire";
+      img.addEventListener("click", () => openLightbox(msg.attachment, isFromMe ? "Tua foto inviata" : "Foto dal Game Master"));
+      bubble.append(img);
+    }
+
+    const time = document.createElement("div");
+    time.className = "chat-bubble-time";
+    time.textContent = new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+    bubble.append(time);
+
+    bubblesArea.append(bubble);
+  }
+
+  // Scorrimento verso il basso
+  bubblesArea.scrollTop = bubblesArea.scrollHeight;
+}
+
 function renderFinalResults(summary, container) {
   container.replaceChildren();
   const winnersBox = document.createElement("div");
@@ -432,14 +554,19 @@ function openProofModal(mission) {
   document.querySelector("#proof-mission-id").value = mission.id;
   document.querySelector("#proof-dialog-title").textContent = `Prova per: ${mission.title}`;
   document.querySelector("#proof-text").value = "";
+  proofPhotoAttachment = null;
+  const preview = document.querySelector("#proof-photo-preview-wrap");
+  if (preview) preview.hidden = true;
+  const input = document.querySelector("#proof-photo-input");
+  if (input) input.value = "";
   proofDialog.showModal();
 }
 
-async function submitPlayerMission(missionId, action, proof = "") {
+async function submitPlayerMission(missionId, action, proof = "", proofAttachment = null) {
   try {
     await api(`/api/player/missions/${encodeURIComponent(missionId)}/${action}`, {
       method: "POST",
-      body: JSON.stringify({ proof }),
+      body: JSON.stringify({ proof, proofAttachment }),
     }, playerToken);
     showToast(action === "start" ? "Missione avviata!" : "Prova inviata al Giudice!");
     await loadPlayerDashboard();
@@ -1138,6 +1265,26 @@ function renderJudgeOperations() {
       `${m.description}${m.proof ? ` | Prova inviata: "${m.proof}"` : ""}`,
       `${m.score} pt · Turno ${m.turn_number} · ${m.status}`
     );
+
+    // Mostra anteprima prova fotografica se presente
+    if (m.proof_attachment) {
+      const proofWrap = document.createElement("div");
+      proofWrap.style.marginTop = "8px";
+      const proofLbl = document.createElement("span");
+      proofLbl.style.fontSize = "0.78rem";
+      proofLbl.style.color = "var(--gold)";
+      proofLbl.style.display = "block";
+      proofLbl.textContent = "📸 Foto di prova inviata:";
+      const img = document.createElement("img");
+      img.className = "proof-thumbnail-img";
+      img.src = m.proof_attachment;
+      img.alt = `Prova di ${m.participant_name}`;
+      img.title = "Clicca per ingrandire la prova";
+      img.addEventListener("click", () => openLightbox(m.proof_attachment, `Prova di ${m.participant_name} per: ${m.title}`));
+      proofWrap.append(proofLbl, img);
+      card.append(proofWrap);
+    }
+
     if (m.status === "submitted" || m.status === "under_review") {
       const btnRow = document.createElement("div");
       btnRow.className = "record-actions";
@@ -1157,55 +1304,37 @@ function renderJudgeOperations() {
     missionList.append(card);
   }
 
-  // Messaggi lista
+  // FASE 4: WhatsApp / Telegram Messenger
+  renderJudgeChatMessenger();
+
+  // Messaggi lista legacy (per retrocompatibilità o audit)
   const messageList = document.querySelector("#judge-message-list");
-  messageList.replaceChildren();
-  for (const msg of state.messages) {
-    const isPlayer = msg.sender === "player";
-    const title = isPlayer ? `💬 Da ${msg.participant_name}` : `📤 Inviato dal Giudice`;
-    const rec = makeRecord(title, msg.body, new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }));
+  if (messageList) {
+    messageList.replaceChildren();
+    for (const msg of state.messages) {
+      const isPlayer = msg.sender === "player";
+      const title = isPlayer ? `💬 Da ${msg.participant_name}` : `📤 Inviato dal Giudice`;
+      const rec = makeRecord(title, msg.body, new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }));
 
-    if (isPlayer && msg.kind === "report" && msg.status === "pending") {
-      const btnRow = document.createElement("div");
-      btnRow.className = "record-actions";
-      const approveBtn = document.createElement("button");
-      approveBtn.className = "button secondary";
-      approveBtn.textContent = "✓ Approva segnalazione";
-      approveBtn.addEventListener("click", () => reviewReport(msg.id, "approved"));
+      if (isPlayer && msg.kind === "report" && msg.status === "pending") {
+        const btnRow = document.createElement("div");
+        btnRow.className = "record-actions";
+        const approveBtn = document.createElement("button");
+        approveBtn.className = "button secondary";
+        approveBtn.textContent = "✓ Approva segnalazione";
+        approveBtn.addEventListener("click", () => reviewReport(msg.id, "approved"));
 
-      const rejectBtn = document.createElement("button");
-      rejectBtn.className = "button quiet";
-      rejectBtn.textContent = "✕ Respingi";
-      rejectBtn.addEventListener("click", () => reviewReport(msg.id, "rejected"));
+        const rejectBtn = document.createElement("button");
+        rejectBtn.className = "button quiet";
+        rejectBtn.textContent = "✕ Respingi";
+        rejectBtn.addEventListener("click", () => reviewReport(msg.id, "rejected"));
 
-      btnRow.append(approveBtn, rejectBtn);
-      rec.append(btnRow);
+        btnRow.append(approveBtn, rejectBtn);
+        rec.append(btnRow);
+      }
+
+      messageList.append(rec);
     }
-
-    if (isPlayer && msg.participant_id) {
-      const replyBtn = document.createElement("button");
-      replyBtn.className = "button quiet";
-      replyBtn.style.marginTop = "6px";
-      replyBtn.textContent = "✉️ Rispondi in privato";
-      replyBtn.addEventListener("click", async () => {
-        const text = window.prompt(`Rispondi privatamente a ${msg.participant_name}:`);
-        if (!text?.trim()) return;
-        try {
-          const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/messages` : "/api/judge/messages";
-          await api(url, {
-            method: "POST",
-            body: JSON.stringify({ participantId: msg.participant_id, body: text.trim(), subject: "Risposta del Giudice" })
-          });
-          showToast("Risposta inviata con successo!");
-          await loadJudgeState();
-        } catch (err) {
-          showToast(err.message);
-        }
-      });
-      rec.append(replyBtn);
-    }
-
-    messageList.append(rec);
   }
 
   // Azioni segrete lista (FIX: mostra sia pending che già valutate)
@@ -1267,6 +1396,259 @@ function renderJudgeOperations() {
   } else {
     voteResults.append(makeRecord("Nessun voto registrato", "I risultati compariranno dopo la chiusura della votazione.", "Vuoto"));
   }
+}
+
+function renderJudgeChatMessenger() {
+  const threadsContainer = document.querySelector("#judge-chat-threads");
+  const bubblesArea = document.querySelector("#judge-chat-bubbles");
+  if (!threadsContainer || !bubblesArea || !state) return;
+
+  const participants = state.participants || [];
+  const messages = state.messages || [];
+  const searchInput = document.querySelector("#judge-chat-search");
+  const searchVal = (searchInput?.value || "").toLowerCase().trim();
+
+  threadsContainer.replaceChildren();
+
+  // 1. Thread Canale Annunci Globali (Tutti)
+  const broadcastItem = document.createElement("div");
+  broadcastItem.className = `chat-thread-item ${activeJudgeChatParticipantId === null ? "active" : ""}`;
+  broadcastItem.setAttribute("role", "option");
+
+  const bAvatar = document.createElement("div");
+  bAvatar.className = "chat-thread-avatar broadcast-avatar";
+  bAvatar.textContent = "📢";
+
+  const bBody = document.createElement("div");
+  bBody.className = "chat-thread-body";
+
+  const bRow = document.createElement("div");
+  bRow.className = "chat-thread-row";
+
+  const bName = document.createElement("div");
+  bName.className = "chat-thread-name";
+  bName.textContent = "📢 Canale Annunci (Tutti)";
+
+  const lastBroadcast = [...messages].reverse().find((m) => m.participant_id === null);
+  const bTime = document.createElement("div");
+  bTime.className = "chat-thread-time";
+  bTime.textContent = lastBroadcast ? new Date(lastBroadcast.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) : "";
+
+  bRow.append(bName, bTime);
+
+  const bPrev = document.createElement("div");
+  bPrev.className = "chat-thread-preview";
+  bPrev.textContent = lastBroadcast ? lastBroadcast.body : "Messaggi inviati a tutta la partita contemporaneamente";
+
+  bBody.append(bRow, bPrev);
+  broadcastItem.append(bAvatar, bBody);
+  broadcastItem.addEventListener("click", () => {
+    activeJudgeChatParticipantId = null;
+    renderJudgeChatMessenger();
+  });
+  threadsContainer.append(broadcastItem);
+
+  // 2. Thread per ciascun partecipante
+  const filteredParticipants = participants.filter((p) => {
+    if (!searchVal) return true;
+    const nameMatch = p.name.toLowerCase().includes(searchVal);
+    const roleMatch = (p.role_name || p.role || "").toLowerCase().includes(searchVal);
+    return nameMatch || roleMatch;
+  });
+
+  if (filteredParticipants.length === 0 && participants.length > 0) {
+    const noMatch = document.createElement("div");
+    noMatch.className = "chat-thread-empty";
+    noMatch.textContent = "Nessun giocatore corrisponde al filtro.";
+    threadsContainer.append(noMatch);
+  }
+
+  for (const p of filteredParticipants) {
+    const item = document.createElement("div");
+    item.className = `chat-thread-item ${activeJudgeChatParticipantId === p.id ? "active" : ""}`;
+    item.setAttribute("role", "option");
+
+    const avatar = document.createElement("div");
+    avatar.className = "chat-thread-avatar";
+    avatar.textContent = p.online ? "🟢" : "👤";
+
+    const body = document.createElement("div");
+    body.className = "chat-thread-body";
+
+    const row = document.createElement("div");
+    row.className = "chat-thread-row";
+
+    const name = document.createElement("div");
+    name.className = "chat-thread-name";
+    name.textContent = p.name;
+
+    const pMessages = messages.filter((m) => m.participant_id === p.id);
+    const lastMsg = pMessages[pMessages.length - 1];
+
+    const time = document.createElement("div");
+    time.className = "chat-thread-time";
+    time.textContent = lastMsg ? new Date(lastMsg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) : "";
+
+    row.append(name, time);
+
+    const prev = document.createElement("div");
+    prev.className = "chat-thread-preview";
+    if (lastMsg) {
+      prev.textContent = (lastMsg.sender === "judge" ? "Tu: " : "") + (lastMsg.body || "Foto");
+    } else {
+      prev.textContent = "Nessun messaggio ancora.";
+    }
+
+    const badges = document.createElement("div");
+    badges.className = "chat-thread-badges";
+
+    const roleTag = document.createElement("span");
+    roleTag.className = "chat-badge-role";
+    roleTag.textContent = p.role_name || p.role || "In attesa";
+    badges.append(roleTag);
+
+    const hasPhoto = pMessages.some((m) => Boolean(m.attachment));
+    if (hasPhoto) {
+      const photoTag = document.createElement("span");
+      photoTag.className = "chat-badge-photo";
+      photoTag.textContent = "📷 Foto";
+      badges.append(photoTag);
+    }
+
+    body.append(row, prev, badges);
+    item.append(avatar, body);
+
+    item.addEventListener("click", () => {
+      activeJudgeChatParticipantId = p.id;
+      renderJudgeChatMessenger();
+    });
+
+    threadsContainer.append(item);
+  }
+
+  // Header della chat attiva
+  const activeParticipant = participants.find((p) => p.id === activeJudgeChatParticipantId);
+  const activeAvatar = document.querySelector("#judge-chat-active-avatar");
+  const activeName = document.querySelector("#judge-chat-active-name");
+  const activeSubtitle = document.querySelector("#judge-chat-active-subtitle");
+  const quickActions = document.querySelector("#judge-chat-quick-actions");
+  const attachBtn = document.querySelector("#judge-chat-attach-btn");
+  const chatInput = document.querySelector("#judge-direct-chat-input");
+  const submitBtn = document.querySelector("#judge-direct-chat-submit");
+
+  if (activeJudgeChatParticipantId === null) {
+    if (activeAvatar) activeAvatar.textContent = "📢";
+    if (activeName) activeName.textContent = "Annunci Globali (Tutti i Giocatori)";
+    if (activeSubtitle) activeSubtitle.textContent = "I messaggi inviati qui saranno visibili in tempo reale a tutti";
+    if (quickActions) quickActions.hidden = true;
+    if (attachBtn) attachBtn.disabled = false;
+    if (chatInput) {
+      chatInput.disabled = false;
+      chatInput.placeholder = "Scrivi un annuncio visibile a tutti i giocatori...";
+    }
+    if (submitBtn) submitBtn.disabled = false;
+  } else if (activeParticipant) {
+    if (activeAvatar) activeAvatar.textContent = activeParticipant.online ? "🟢" : "👤";
+    if (activeName) activeName.textContent = activeParticipant.name;
+    if (activeSubtitle) activeSubtitle.textContent = `${activeParticipant.role_name || activeParticipant.role || "Nessun ruolo"} · ${activeParticipant.online ? "Online" : "Offline"} · ${activeParticipant.score || 0} pt`;
+    if (quickActions) quickActions.hidden = false;
+    if (attachBtn) attachBtn.disabled = false;
+    if (chatInput) {
+      chatInput.disabled = false;
+      chatInput.placeholder = `Scrivi a ${activeParticipant.name}...`;
+    }
+    if (submitBtn) submitBtn.disabled = false;
+  } else {
+    if (activeAvatar) activeAvatar.textContent = "💬";
+    if (activeName) activeName.textContent = "Seleziona una chat";
+    if (activeSubtitle) activeSubtitle.textContent = "Scegli un giocatore dalla colonna a sinistra";
+    if (quickActions) quickActions.hidden = true;
+    if (attachBtn) attachBtn.disabled = true;
+    if (chatInput) {
+      chatInput.disabled = true;
+      chatInput.placeholder = "Seleziona un giocatore per iniziare...";
+    }
+    if (submitBtn) submitBtn.disabled = true;
+  }
+
+  // RENDER DEI MESSAGGI (BUBBLES)
+  bubblesArea.replaceChildren();
+
+  let conversationMessages = [];
+  if (activeJudgeChatParticipantId === null) {
+    conversationMessages = messages.filter((m) => m.participant_id === null);
+  } else {
+    // Messaggi del partecipante + annunci globali
+    conversationMessages = messages.filter((m) => m.participant_id === activeJudgeChatParticipantId || m.participant_id === null);
+  }
+
+  const sortedConv = [...conversationMessages].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+  if (sortedConv.length === 0) {
+    const emptyNotice = document.createElement("div");
+    emptyNotice.className = "chat-empty-selection";
+    emptyNotice.innerHTML = `
+      <p style="font-size:1.8rem; margin-bottom:8px;">💬</p>
+      <p><strong>Nessun messaggio in questa chat</strong></p>
+      <p class="muted">Scrivi il primo messaggio o allega una foto per iniziare la conversazione.</p>
+    `;
+    bubblesArea.append(emptyNotice);
+  } else {
+    for (const msg of sortedConv) {
+      const isJudge = msg.sender === "judge";
+      const isBroadcast = msg.participant_id === null;
+
+      if (isBroadcast && activeJudgeChatParticipantId !== null) {
+        const sys = document.createElement("div");
+        sys.className = "chat-bubble chat-bubble-system";
+        sys.textContent = `📢 Annuncio Globale del Master: ${msg.body}`;
+        if (msg.attachment) {
+          const img = document.createElement("img");
+          img.className = "chat-bubble-img";
+          img.src = msg.attachment;
+          img.alt = "Allegato";
+          img.addEventListener("click", () => openLightbox(msg.attachment, "Annuncio Globale Master"));
+          sys.append(img);
+        }
+        bubblesArea.append(sys);
+        continue;
+      }
+
+      const bubble = document.createElement("div");
+      bubble.className = `chat-bubble ${isJudge ? "chat-bubble-me" : "chat-bubble-other"}`;
+
+      const senderLabel = document.createElement("div");
+      senderLabel.className = "chat-bubble-sender";
+      senderLabel.textContent = isJudge ? "Tu (Game Master)" : (msg.participant_name || "Giocatore");
+      bubble.append(senderLabel);
+
+      if (msg.body) {
+        const textElem = document.createElement("div");
+        textElem.textContent = msg.body;
+        bubble.append(textElem);
+      }
+
+      if (msg.attachment) {
+        const img = document.createElement("img");
+        img.className = "chat-bubble-img";
+        img.src = msg.attachment;
+        img.alt = "Foto allegata";
+        img.title = "Clicca per ingrandire";
+        img.addEventListener("click", () => openLightbox(msg.attachment, `Foto da ${isJudge ? "Game Master" : msg.participant_name}`));
+        bubble.append(img);
+      }
+
+      const timeElem = document.createElement("div");
+      timeElem.className = "chat-bubble-time";
+      timeElem.textContent = new Date(msg.created_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+      bubble.append(timeElem);
+
+      bubblesArea.append(bubble);
+    }
+  }
+
+  // Scroll automatico verso il basso
+  bubblesArea.scrollTop = bubblesArea.scrollHeight;
 }
 
 async function reviewMission(missionId, status) {
@@ -2174,6 +2556,210 @@ document.querySelector("#judge-new-game-btn")?.addEventListener("click", async (
 // Timers
 setInterval(renderJudgeTimer, 1000);
 setInterval(renderPlayerTimer, 1000);
+
+// ====================================================
+// EVENT LISTENERS: LIGHTBOX, CHAT & FOTO PROVE
+// ====================================================
+
+// 1. Lightbox full-screen viewer
+document.querySelector("#lightbox-close-btn")?.addEventListener("click", () => {
+  document.querySelector("#image-lightbox-dialog")?.close();
+});
+document.querySelector("#image-lightbox-dialog")?.addEventListener("click", (e) => {
+  if (e.target.id === "image-lightbox-dialog") {
+    e.target.close();
+  }
+});
+
+// 2. Foto prova missione (Player)
+document.querySelector("#proof-photo-btn")?.addEventListener("click", () => {
+  document.querySelector("#proof-photo-input")?.click();
+});
+
+document.querySelector("#proof-photo-input")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const dataUrl = await compressImage(file, 1200, 0.72);
+    proofPhotoAttachment = dataUrl;
+    const preview = document.querySelector("#proof-photo-preview");
+    if (preview) preview.src = dataUrl;
+    const wrap = document.querySelector("#proof-photo-preview-wrap");
+    if (wrap) wrap.hidden = false;
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+document.querySelector("#proof-remove-photo-btn")?.addEventListener("click", () => {
+  proofPhotoAttachment = null;
+  const input = document.querySelector("#proof-photo-input");
+  if (input) input.value = "";
+  const wrap = document.querySelector("#proof-photo-preview-wrap");
+  if (wrap) wrap.hidden = true;
+});
+
+document.querySelector("#cancel-proof-btn")?.addEventListener("click", () => {
+  proofDialog.close();
+});
+
+document.querySelector("#proof-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const missionId = document.querySelector("#proof-mission-id").value;
+  const text = document.querySelector("#proof-text").value;
+  await submitPlayerMission(missionId, "submit", text, proofPhotoAttachment);
+  proofDialog.close();
+});
+
+// 3. Chat Giocatore (Player)
+document.querySelector("#player-chat-attach-btn")?.addEventListener("click", () => {
+  document.querySelector("#player-chat-photo-input")?.click();
+});
+
+document.querySelector("#player-chat-photo-input")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const dataUrl = await compressImage(file, 1200, 0.72);
+    playerChatAttachment = dataUrl;
+    const preview = document.querySelector("#player-chat-photo-preview");
+    if (preview) preview.src = dataUrl;
+    const wrap = document.querySelector("#player-chat-preview-wrap");
+    if (wrap) wrap.hidden = false;
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+document.querySelector("#player-chat-remove-photo")?.addEventListener("click", () => {
+  playerChatAttachment = null;
+  const input = document.querySelector("#player-chat-photo-input");
+  if (input) input.value = "";
+  const wrap = document.querySelector("#player-chat-preview-wrap");
+  if (wrap) wrap.hidden = true;
+});
+
+document.querySelector("#player-chat-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = document.querySelector("#player-chat-input");
+  const text = (input?.value || "").trim();
+  if (!text && !playerChatAttachment) return;
+  try {
+    await api("/api/player/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: "message",
+        body: text || "📷 [Foto inviata]",
+        attachment: playerChatAttachment,
+      }),
+    }, playerToken);
+    if (input) input.value = "";
+    playerChatAttachment = null;
+    const inputPhoto = document.querySelector("#player-chat-photo-input");
+    if (inputPhoto) inputPhoto.value = "";
+    const wrap = document.querySelector("#player-chat-preview-wrap");
+    if (wrap) wrap.hidden = true;
+    await loadPlayerDashboard();
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+// 4. WhatsApp / Telegram Messenger Master
+document.querySelector("#judge-chat-search")?.addEventListener("input", () => {
+  renderJudgeChatMessenger();
+});
+
+document.querySelector("#judge-chat-attach-btn")?.addEventListener("click", () => {
+  document.querySelector("#judge-chat-photo-input")?.click();
+});
+
+document.querySelector("#judge-chat-photo-input")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const dataUrl = await compressImage(file, 1200, 0.72);
+    judgeChatAttachment = dataUrl;
+    const preview = document.querySelector("#judge-chat-photo-preview");
+    if (preview) preview.src = dataUrl;
+    const wrap = document.querySelector("#judge-chat-preview-wrap");
+    if (wrap) wrap.hidden = false;
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+document.querySelector("#judge-chat-remove-photo")?.addEventListener("click", () => {
+  judgeChatAttachment = null;
+  const input = document.querySelector("#judge-chat-photo-input");
+  if (input) input.value = "";
+  const wrap = document.querySelector("#judge-chat-preview-wrap");
+  if (wrap) wrap.hidden = true;
+});
+
+document.querySelector("#judge-direct-chat-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = document.querySelector("#judge-direct-chat-input");
+  const text = (input?.value || "").trim();
+  if (!text && !judgeChatAttachment) return;
+  try {
+    const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/messages` : "/api/judge/messages";
+    await api(url, {
+      method: "POST",
+      body: JSON.stringify({
+        ...(activeJudgeChatParticipantId ? { participantId: activeJudgeChatParticipantId } : {}),
+        body: text || "📷 [Foto inviata dal Master]",
+        attachment: judgeChatAttachment,
+        subject: activeJudgeChatParticipantId ? "Messaggio riservato" : "Annuncio a tutti",
+      }),
+    });
+    if (input) input.value = "";
+    judgeChatAttachment = null;
+    const inputPhoto = document.querySelector("#judge-chat-photo-input");
+    if (inputPhoto) inputPhoto.value = "";
+    const wrap = document.querySelector("#judge-chat-preview-wrap");
+    if (wrap) wrap.hidden = true;
+    await loadJudgeState();
+  } catch (err) {
+    showToast(err.message);
+  }
+});
+
+// Quick Actions in Chat Header
+document.querySelector("#judge-chat-quick-score-btn")?.addEventListener("click", () => {
+  if (!activeJudgeChatParticipantId) return;
+  const scoreParticipant = document.querySelector("#score-participant");
+  if (scoreParticipant) scoreParticipant.value = activeJudgeChatParticipantId;
+  const scoreReason = document.querySelector("#score-reason");
+  if (scoreReason) {
+    scoreReason.focus();
+    scoreReason.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+});
+
+document.querySelector("#judge-chat-quick-mission-btn")?.addEventListener("click", () => {
+  if (!activeJudgeChatParticipantId) return;
+  const targetType = document.querySelector("#mission-target-type");
+  if (targetType) {
+    targetType.value = "player";
+    targetType.dispatchEvent(new Event("change"));
+  }
+  const partSelect = document.querySelector("#mission-participant");
+  if (partSelect) partSelect.value = activeJudgeChatParticipantId;
+  const titleInput = document.querySelector("#mission-title");
+  if (titleInput) {
+    titleInput.focus();
+    titleInput.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+});
+
+document.querySelector("#btn-toggle-broadcast")?.addEventListener("click", () => {
+  const details = document.querySelector("#broadcast-panel-details");
+  if (details) {
+    details.open = !details.open;
+    if (details.open) details.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+});
 
 // Auto-init on page load
 if (playerToken) {

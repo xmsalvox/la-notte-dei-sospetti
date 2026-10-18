@@ -202,30 +202,53 @@
             </div>
           </div>
 
-          <!-- SEZIONE MESSAGGI -->
+          <!-- SEZIONE MESSAGGI (CHAT CON IL GAME MASTER) -->
           <div id="subview-messages" class="player-subview" hidden>
             <div class="panel-section">
-              <h3>Comunicazione riservata con il Giudice</h3>
-              <p class="section-copy">Scrivi al Giudice in totale segretezza per segnalare un fatto, porre una domanda o inviare un indizio.</p>
-              <form id="player-message-form" class="form-grid">
-                <label>Tipo di messaggio
-                  <select id="player-message-kind">
-                    <option value="message">💬 Messaggio / Domanda privata</option>
-                    <option value="report">🚨 Segnalazione infrazione / Sospetto</option>
-                  </select>
-                </label>
-                <label>Oggetto (opzionale)
-                  <input id="player-message-subject" maxlength="100" placeholder="Es. Ho visto un'azione strana">
-                </label>
-                <label class="wide">Messaggio
-                  <textarea id="player-message-body" rows="3" maxlength="5000" required placeholder="Scrivi al Giudice..."></textarea>
-                </label>
-                <div class="wide">
-                  <button class="button secondary" type="submit">Invia messaggio</button>
+              <div class="section-title-row">
+                <div>
+                  <h3>💬 Chat con il Game Master</h3>
+                  <p class="section-copy">Canale privato e diretto con la regia. Puoi inviare messaggi, segnalazioni e prove fotografiche in tempo reale.</p>
                 </div>
-              </form>
-              <h4>Cronologia messaggi con il Giudice</h4>
-              <div id="player-messages" class="record-list"></div>
+              </div>
+              <div id="player-chat-container" class="chat-messenger-view">
+                <div id="player-chat-bubbles" class="chat-bubbles-area">
+                  <div class="chat-system-notice">Benvenuto nel canale riservato. Tutto ciò che scrivi è visibile solo al Game Master.</div>
+                </div>
+                <div id="player-chat-preview-wrap" class="chat-attachment-preview-wrap" hidden>
+                  <img id="player-chat-photo-preview" class="chat-attachment-preview-img" alt="Anteprima">
+                  <button id="player-chat-remove-photo" type="button" class="chat-remove-photo-btn" title="Rimuovi foto">✕</button>
+                </div>
+                <form id="player-chat-form" class="chat-input-bar">
+                  <input type="file" id="player-chat-photo-input" accept="image/*" capture="environment" hidden>
+                  <button type="button" id="player-chat-attach-btn" class="chat-btn-attach" title="Scatta o allega foto">📷</button>
+                  <input type="text" id="player-chat-input" placeholder="Scrivi un messaggio o segnalazione al Master..." autocomplete="off" required>
+                  <button type="submit" class="button primary chat-btn-send">Invia ➤</button>
+                </form>
+              </div>
+
+              <!-- Accordion per messaggi classici / segnalazioni formali -->
+              <details style="margin-top:20px; font-size:0.9rem;" class="subtle-details">
+                <summary style="cursor:pointer; color:var(--text-muted);">Modulo avanzato / Segnalazione anonima formale</summary>
+                <form id="player-message-form" class="form-grid" style="margin-top:10px;">
+                  <label>Tipo di messaggio
+                    <select id="player-message-kind">
+                      <option value="message">💬 Messaggio / Domanda privata</option>
+                      <option value="report">🚨 Segnalazione infrazione / Sospetto</option>
+                    </select>
+                  </label>
+                  <label>Oggetto (opzionale)
+                    <input id="player-message-subject" maxlength="100" placeholder="Es. Ho visto un'azione strana">
+                  </label>
+                  <label class="wide">Messaggio
+                    <textarea id="player-message-body" rows="2" maxlength="5000" placeholder="Scrivi qui..."></textarea>
+                  </label>
+                  <div class="wide">
+                    <button class="button quiet" type="submit">Invia segnalazione formale</button>
+                  </div>
+                </form>
+              </details>
+              <div id="player-messages" class="record-list" hidden></div>
             </div>
           </div>
 
@@ -597,37 +620,97 @@
           <div id="judge-mission-list" class="record-list"></div>
         </section>
 
-        <!-- FASE 4: COMUNICAZIONI GIUDICE -->
+        <!-- FASE 4: MESSENGER & COMUNICAZIONI GAME MASTER -->
         <section class="panel" aria-labelledby="messages-title">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">FASE 4 · COMUNICAZIONI</p>
-              <h2 id="messages-title">Messaggi & Annunci del Giudice</h2>
+              <p class="eyebrow">FASE 4 · MESSENGER & REGIA CHAT</p>
+              <h2 id="messages-title">💬 Chat WhatsApp / Telegram con i Giocatori</h2>
+            </div>
+            <button id="btn-toggle-broadcast" class="button quiet" type="button">📢 Annuncio Globale a Tutti</button>
+          </div>
+
+          <!-- MODULO ANNUNCIO GLOBALE COLLAPSIBILE -->
+          <details id="broadcast-panel-details" class="broadcast-details" style="margin-bottom:16px;">
+            <summary class="button secondary" style="display:inline-flex; align-items:center; gap:8px; cursor:pointer;">
+              <span>📢 Invia Annuncio Globale a Tutta la Partita</span>
+            </summary>
+            <form id="judge-message-form" class="form-grid" style="margin-top:12px; padding:14px; background:var(--panel-light); border-radius:10px;">
+              <label>Destinatari
+                <select id="judge-message-target-type">
+                  <option value="all">📢 Tutti i partecipanti (Annuncio globale)</option>
+                  <option value="player">👤 Singolo giocatore (Privato)</option>
+                  <option value="team">👥 Tutta una squadra / fazione</option>
+                </select>
+              </label>
+              <label id="message-participant-field" hidden>Giocatore
+                <select id="message-participant"></select>
+              </label>
+              <label id="message-team-field" hidden>Squadra
+                <select id="message-team"></select>
+              </label>
+              <label>Oggetto<input id="message-subject" placeholder="Es. Comunicazione importante dal Master"></label>
+              <label class="wide">Testo della comunicazione<textarea id="judge-message-body" rows="2" placeholder="Scrivi il messaggio broadcast..."></textarea></label>
+              <div class="form-actions wide">
+                <button class="button secondary" type="submit">Invia Annuncio</button>
+              </div>
+            </form>
+          </details>
+
+          <!-- 2-COLUMN WHATSAPP / TELEGRAM STYLE MESSENGER -->
+          <div class="chat-messenger-container">
+            <!-- COLONNA SINISTRA: ELENCO CHAT / PARTECIPANTI -->
+            <div class="chat-sidebar">
+              <div class="chat-sidebar-header">
+                <input type="text" id="judge-chat-search" placeholder="🔍 Cerca chat giocatore..." class="chat-search-input">
+              </div>
+              <div id="judge-chat-threads" class="chat-threads-list" role="listbox" aria-label="Elenco chat partecipanti">
+                <div class="chat-thread-empty">Nessun giocatore in stanza</div>
+              </div>
+            </div>
+
+            <!-- COLONNA DESTRA: FINESTRA CHAT ATTIVA -->
+            <div class="chat-main-window">
+              <div class="chat-active-header">
+                <div class="chat-active-user-info">
+                  <span id="judge-chat-active-avatar" class="chat-active-avatar">💬</span>
+                  <div>
+                    <strong id="judge-chat-active-name">Seleziona una chat</strong>
+                    <span id="judge-chat-active-subtitle" class="chat-active-subtitle">Scegli un giocatore dalla colonna a sinistra</span>
+                  </div>
+                </div>
+                <div class="chat-active-quick-actions" id="judge-chat-quick-actions" hidden>
+                  <button type="button" id="judge-chat-quick-score-btn" class="button quiet" title="Assegna o togli punti">⭐ Punti</button>
+                  <button type="button" id="judge-chat-quick-mission-btn" class="button quiet" title="Assegna una missione">🎯 Missione</button>
+                </div>
+              </div>
+
+              <!-- AREA MESSAGGI SCORREVOLE -->
+              <div id="judge-chat-bubbles" class="chat-bubbles-area">
+                <div class="chat-empty-selection">
+                  <p style="font-size:1.8rem; margin-bottom:8px;">📱</p>
+                  <p><strong>Chat Regia Game Master</strong></p>
+                  <p class="muted">Seleziona un giocatore dall'elenco per visualizzare le comunicazioni, ricevere prove fotografiche e inviare ordini segreti.</p>
+                </div>
+              </div>
+
+              <!-- ANTEPRIMA ALLEGATO FOTO -->
+              <div id="judge-chat-preview-wrap" class="chat-attachment-preview-wrap" hidden>
+                <img id="judge-chat-photo-preview" class="chat-attachment-preview-img" alt="Anteprima">
+                <button id="judge-chat-remove-photo" type="button" class="chat-remove-photo-btn" title="Rimuovi allegato">✕</button>
+              </div>
+
+              <!-- BARRA INPUT CHAT MASTER -->
+              <form id="judge-direct-chat-form" class="chat-input-bar">
+                <input type="file" id="judge-chat-photo-input" accept="image/*" hidden>
+                <button type="button" id="judge-chat-attach-btn" class="chat-btn-attach" title="Invia foto, indizio o documento" disabled>📷</button>
+                <input type="text" id="judge-direct-chat-input" placeholder="Seleziona un giocatore per iniziare a chattare..." autocomplete="off" disabled required>
+                <button type="submit" id="judge-direct-chat-submit" class="button primary chat-btn-send" disabled>Invia ➤</button>
+              </form>
             </div>
           </div>
-          <form id="judge-message-form" class="form-grid">
-            <label>Destinatari
-              <select id="judge-message-target-type">
-                <option value="all">📢 Tutti i partecipanti (Annuncio globale)</option>
-                <option value="player">👤 Singolo giocatore (Privato)</option>
-                <option value="team">👥 Tutta una squadra / fazione</option>
-              </select>
-            </label>
-            <label id="message-participant-field" hidden>Giocatore
-              <select id="message-participant"></select>
-            </label>
-            <label id="message-team-field" hidden>Squadra
-              <select id="message-team"></select>
-            </label>
-            <label>Oggetto<input id="message-subject" placeholder="Es. Indizio della notte"></label>
-            <label class="wide">Testo della comunicazione<textarea id="judge-message-body" rows="3" required placeholder="Scrivi il messaggio da inviare..."></textarea></label>
-            <div class="form-actions wide">
-              <button class="button secondary" type="submit">Invia Comunicazione</button>
-            </div>
-          </form>
 
-          <h4>Cronologia comunicazioni e segnalazioni ricevute</h4>
-          <div id="judge-message-list" class="record-list"></div>
+          <div id="judge-message-list" class="record-list" hidden></div>
         </section>
 
         <!-- FASE 5: OPERAZIONI DI GIOCO, VOTAZIONI & TIMER -->
@@ -770,13 +853,36 @@
         <form id="proof-form">
           <input id="proof-mission-id" type="hidden">
           <label>Descrivi come hai compiuto la missione o cosa hai scoperto:
-            <textarea id="proof-text" rows="4" required placeholder="Inserisci i dettagli da mostrare al Giudice..."></textarea>
+            <textarea id="proof-text" rows="3" required placeholder="Inserisci i dettagli da mostrare al Giudice..."></textarea>
           </label>
+
+          <!-- CARICAMENTO / FOTO PROVA -->
+          <div class="proof-photo-box" style="margin: 14px 0;">
+            <label style="font-weight:600; display:block; margin-bottom:6px;">📸 Foto o prova visiva (opzionale):</label>
+            <input type="file" id="proof-photo-input" accept="image/*" capture="environment" hidden>
+            <button type="button" id="proof-photo-btn" class="button secondary" style="display:inline-flex; align-items:center; gap:8px;">
+              <span>📷 Scatta o carica foto di prova</span>
+            </button>
+            <div id="proof-photo-preview-wrap" class="chat-attachment-preview-wrap" style="margin-top:10px;" hidden>
+              <img id="proof-photo-preview" class="chat-attachment-preview-img" alt="Foto Prova">
+              <button id="proof-remove-photo-btn" type="button" class="chat-remove-photo-btn" title="Rimuovi foto">✕</button>
+            </div>
+          </div>
+
           <div class="dialog-actions" style="margin-top:16px;">
             <button id="cancel-proof-btn" class="button quiet" type="button">Annulla</button>
             <button class="button primary" type="submit">Invia Prova al Giudice</button>
           </div>
         </form>
+      </div>
+    </dialog>
+
+    <!-- MODAL LIGHTBOX IMMAGINI A SCHERMO INTERO -->
+    <dialog id="image-lightbox-dialog" class="dialog image-lightbox-dialog">
+      <div class="lightbox-container">
+        <button id="lightbox-close-btn" type="button" class="lightbox-close-btn" aria-label="Chiudi visualizzatore">✕</button>
+        <img id="lightbox-img" class="lightbox-img" src="" alt="Dettaglio immagine a schermo intero">
+        <p id="lightbox-caption" class="lightbox-caption"></p>
       </div>
     </dialog>
 
