@@ -304,8 +304,8 @@ input:focus, select:focus, textarea:focus {
 /* LISTE PARTECIPANTI & RUOLI */
 .participant-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
   margin: 16px 0 0;
   padding: 0;
   list-style: none;
@@ -318,16 +318,59 @@ input:focus, select:focus, textarea:focus {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(18, 11, 23, 0.45);
+  flex-wrap: wrap;
 }
 .participant-number { color: var(--gold); font-size: 0.8rem; font-weight: 700; }
-.participant-item input { padding: 6px 10px; }
+.participant-item input.name-edit {
+  flex: 1 1 120px;
+  min-width: 90px;
+  padding: 6px 10px;
+}
+.participant-pin-wrap {
+  display: inline-flex;
+  align-items: center;
+}
+.pin-tag {
+  background: var(--panel-light);
+  border: 1px solid var(--line);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  color: var(--gold);
+  white-space: nowrap;
+}
+.pin-tag strong {
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+.copy-btn-sm {
+  padding: 4px 8px !important;
+  font-size: 0.78rem !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 6px;
+  background: rgba(40, 26, 52, 0.6) !important;
+  white-space: nowrap;
+}
+.copy-btn-sm:hover {
+  background: var(--panel-hover) !important;
+  border-color: var(--orange) !important;
+}
+.edit-pin-btn {
+  padding: 4px 6px !important;
+  font-size: 0.78rem !important;
+  border-radius: 6px;
+}
 .participant-item .remove {
   flex: 0 0 auto;
   border: 0;
   padding: 4px 8px;
   color: var(--red);
   background: transparent;
-  font-size: 0.85rem;
+  font-size: 0.95rem;
+  font-weight: bold;
+}
+.participant-item .remove:hover {
+  color: #ff4d4d;
 }
 .empty-state {
   margin: 18px 0 !important;

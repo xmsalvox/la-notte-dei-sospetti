@@ -206,6 +206,26 @@ for (const table of ["participants", "role_history", "missions", "messages", "se
   }
 }
 
+function generateUniqueParticipantPin(roomId) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const pin = String(crypto.randomInt(1000, 9999));
+    const exists = db.prepare("SELECT 1 FROM participants WHERE room_id = ? AND pin = ?").get(roomId, pin);
+    if (!exists) return pin;
+  }
+  return String(crypto.randomInt(10000, 99999));
+}
+
+// Ensure all participants have a PIN
+try {
+  const pinless = db.prepare("SELECT id, room_id FROM participants WHERE pin IS NULL OR TRIM(pin) = ''").all();
+  for (const p of pinless) {
+    const newPin = generateUniqueParticipantPin(p.room_id);
+    db.prepare("UPDATE participants SET pin = ? WHERE id = ?").run(newPin, p.id);
+  }
+} catch (err) {
+  console.error("Migration error assigning participant PINs:", err);
+}
+
 const usersTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (usersTable) {
   const cols = new Set(db.prepare("PRAGMA table_info(users)").all().map((c) => c.name));
@@ -549,7 +569,9 @@ function requireUser(req, res) {
 
 function getRoomByCode(code) {
   if (!code) return null;
-  return db.prepare("SELECT * FROM rooms WHERE UPPER(code) = UPPER(?)").get(code.trim());
+  const clean = String(code).trim();
+  if (!clean) return null;
+  return db.prepare("SELECT * FROM rooms WHERE UPPER(TRIM(code)) = UPPER(TRIM(?))").get(clean);
 }
 
 function getRoomById(id) {
@@ -574,15 +596,13 @@ function resolveRoom(req, url) {
   // 1. /api/rooms/:code/...
   const match = url.pathname.match(/^\/api\/rooms\/([^/]+)/);
   if (match) {
-    const code = decodeURIComponent(match[1]);
-    const room = getRoomByCode(code);
-    if (room) return room;
+    const code = decodeURIComponent(match[1]).trim().toUpperCase();
+    return getRoomByCode(code);
   }
   // 2. Query param or header
   const paramCode = url.searchParams.get("room") || req.headers["x-room-code"];
   if (paramCode) {
-    const room = getRoomByCode(paramCode);
-    if (room) return room;
+    return getRoomByCode(String(paramCode).trim().toUpperCase());
   }
   // 3. Active room in judge session
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
@@ -593,7 +613,7 @@ function resolveRoom(req, url) {
       if (room) return room;
     }
   }
-  // 4. Fallback to default room
+  // 4. Fallback to default room (only if no room was specified)
   return getRoomById(defaultRoom.id);
 }
 
@@ -696,7 +716,7 @@ function getCounts(roomId) {
 }
 
 function getValidation(roomId) {
-  const participants = db.prepare("SELECT id, name, role FROM participants WHERE room_id = ? ORDER BY name").all(roomId);
+  const participants = db.prepare("SELECT id, name, role, pin FROM participants WHERE room_id = ? ORDER BY name").all(roomId);
   const targets = getRoleTargets(roomId);
   const counts = getCounts(roomId);
   const roleNames = getRoleNames(roomId);
@@ -1097,46 +1117,74 @@ const server = http.createServer(async (req, res) => {
     }
 
     // --------------------------------------------------
-    // PLAYER JOIN (LOBBY WITH CODE + NICKNAME + PIN)
+    // PLAYER JOIN (LOBBY WITH CODE + PLAYER PIN / PASSWORD)
     // --------------------------------------------------
-    if (route.match(/^POST \/api\/rooms\/[^/]+\/join$/) || route === "POST /api/player/join") {
+    if (route.match(/^POST \/api\/rooms\/[^/]+\/join\/?$/) || route === "POST /api/player/join") {
       const body = await readJson(req);
-      const code = route.match(/^POST \/api\/rooms\/([^/]+)\/join$/)?.[1] || body.roomCode;
+      const rawCode = route.match(/^POST \/api\/rooms\/([^/]+)\/join\/?$/)?.[1] || body.roomCode || body.code;
+      const code = rawCode ? decodeURIComponent(rawCode).trim().toUpperCase() : "";
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Codice stanza inesistente. Verifica il codice a 5 lettere." });
-      const name = String(body.name || "").trim();
-      const pin = body.pin ? String(body.pin).trim() : null;
 
-      if (!name || name.length > 60) {
-        return sendJson(res, 400, { error: "Inserisci un nome partecipante valido (1-60 caratteri)." });
+      const pin = body.pin ? String(body.pin).trim() : (body.password ? String(body.password).trim() : null);
+      const name = body.name ? String(body.name).trim() : null;
+
+      let participant = null;
+
+      // 1. Direct login by PIN/Password (primary method intended by Game Master)
+      if (pin) {
+        participant = db.prepare("SELECT * FROM participants WHERE room_id = ? AND LOWER(TRIM(pin)) = LOWER(TRIM(?))").get(room.id, pin);
       }
 
-      // Check existing player by name in this room
-      const existing = db.prepare("SELECT * FROM participants WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(room.id, name);
+      // 2. Fallback: Search by Name in this room (if PIN was omitted or didn't match directly)
+      if (!participant && name) {
+        const byName = db.prepare("SELECT * FROM participants WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(room.id, name);
+        if (byName) {
+          if (byName.pin && pin && byName.pin.toLowerCase().trim() !== pin.toLowerCase()) {
+            return sendJson(res, 401, { error: "Questo nome è già presente e la Password / PIN inserita non è corretta." });
+          }
+          participant = byName;
+          if (!participant.pin && pin) {
+            db.prepare("UPDATE participants SET pin = ? WHERE id = ?").run(pin, participant.id);
+            participant.pin = pin;
+          }
+        }
+      }
 
-      let participantId;
-      if (existing) {
-        if (existing.pin && pin !== existing.pin) {
-          return sendJson(res, 401, { error: "Questo nome è già presente e il PIN inserito non è corretto." });
+      // 3. Handle not found or auto-create fallback (for tests / legacy self-registration)
+      if (!participant) {
+        const totalParticipants = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ?").get(room.id).count;
+        if (!name && pin) {
+          if (totalParticipants === 0) {
+            return sendJson(res, 404, { error: "Il Game Master non ha ancora inserito partecipanti in questa stanza. Attendi che il Master ti configuri." });
+          }
+          return sendJson(res, 401, { error: "Password / PIN non valida per questa stanza. Verifica il codice fornito dal Game Master." });
         }
-        participantId = existing.id;
-      } else {
-        if (room.status !== "setup") {
-          return sendJson(res, 409, { error: "La partita è già iniziata e non accetta nuovi ingressi." });
+
+        if (name) {
+          if (room.status !== "setup") {
+            return sendJson(res, 409, { error: "La partita è già iniziata e non accetta nuovi ingressi." });
+          }
+          const participantId = crypto.randomUUID();
+          const assignedPin = pin || generateUniqueParticipantPin(room.id);
+          db.prepare("INSERT INTO participants (id, room_id, name, role, pin, created_at) VALUES (?, ?, ?, NULL, ?, ?)").run(
+            participantId, room.id, name, assignedPin, new Date().toISOString()
+          );
+          participant = { id: participantId, room_id: room.id, name, role: null, pin: assignedPin };
+          logAction(room.id, "player", "player_joined", { name, pin: assignedPin });
+        } else {
+          return sendJson(res, 400, { error: "Inserisci la Password / PIN fornita dal tuo Game Master." });
         }
-        participantId = crypto.randomUUID();
-        db.prepare("INSERT INTO participants (id, room_id, name, role, pin, created_at) VALUES (?, ?, ?, NULL, ?, ?)").run(
-          participantId, room.id, name, pin, new Date().toISOString()
-        );
-        logAction(room.id, "player", "player_joined", { name });
       }
 
       const token = crypto.randomBytes(32).toString("base64url");
-      playerSessions.set(token, { participantId, roomId: room.id });
-      saveSession(token, "player", { participantId, roomId: room.id });
+      playerSessions.set(token, { participantId: participant.id, roomId: room.id });
+      saveSession(token, "player", { participantId: participant.id, roomId: room.id });
+      logAction(room.id, "player", "player_logged_in", { name: participant.name, id: participant.id });
+
       return sendJson(res, 200, {
         token,
-        participant: { id: participantId, name, role: existing?.role || null },
+        participant: { id: participant.id, name: participant.name, role: participant.role || null },
         room: { code: room.code, name: room.name, status: room.status },
       });
     }
@@ -1529,10 +1577,21 @@ const server = http.createServer(async (req, res) => {
         if (!name || name.length > 60) return sendJson(res, 400, { error: "Inserisci un nome da 1 a 60 caratteri." });
         const dup = db.prepare("SELECT 1 FROM participants WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))").get(room.id, name);
         if (dup) return sendJson(res, 409, { error: "Questo nome è già presente nell'elenco." });
-        db.prepare("INSERT INTO participants (id, room_id, name, role, created_at) VALUES (?, ?, ?, NULL, ?)").run(
-          crypto.randomUUID(), room.id, name, new Date().toISOString()
+
+        let pin = body.pin ? String(body.pin).trim() : null;
+        if (pin) {
+          const pinDup = db.prepare("SELECT 1 FROM participants WHERE room_id = ? AND LOWER(TRIM(pin)) = LOWER(TRIM(?))").get(room.id, pin);
+          if (pinDup) return sendJson(res, 409, { error: "Questa Password / PIN è già assegnata a un altro partecipante." });
+        } else {
+          pin = generateUniqueParticipantPin(room.id);
+        }
+
+        const participantId = crypto.randomUUID();
+        db.prepare("INSERT INTO participants (id, room_id, name, role, pin, created_at) VALUES (?, ?, ?, NULL, ?, ?)").run(
+          participantId, room.id, name, pin, new Date().toISOString()
         );
-        return sendJson(res, 201, { ok: true });
+        logAction(room.id, "judge", "participant_added", { name, pin });
+        return sendJson(res, 201, { ok: true, participant: { id: participantId, name, pin } });
       }
 
       if (judgeAction.startsWith("PATCH /api/judge/participants/")) {
@@ -1545,6 +1604,18 @@ const server = http.createServer(async (req, res) => {
         const selectedRole = newRole ? db.prepare("SELECT * FROM game_roles WHERE id = ? AND room_id = ?").get(newRole, room.id) : null;
         if (newRole && !selectedRole) return sendJson(res, 400, { error: "Ruolo selezionato non valido." });
 
+        let newPin = participant.pin;
+        if (body.pin !== undefined) {
+          const pinVal = String(body.pin || "").trim();
+          if (pinVal) {
+            const pinDup = db.prepare("SELECT 1 FROM participants WHERE room_id = ? AND id != ? AND LOWER(TRIM(pin)) = LOWER(TRIM(?))").get(room.id, id, pinVal);
+            if (pinDup) return sendJson(res, 409, { error: "Questa Password / PIN è già usata da un altro giocatore." });
+            newPin = pinVal;
+          } else {
+            newPin = generateUniqueParticipantPin(room.id);
+          }
+        }
+
         if (room.started_at && !String(body.reason || "").trim()) {
           return sendJson(res, 400, { error: "Per una modifica eccezionale dopo l'inizio, inserisci il motivo." });
         }
@@ -1554,7 +1625,7 @@ const server = http.createServer(async (req, res) => {
         }
         db.exec("BEGIN IMMEDIATE");
         try {
-          db.prepare("UPDATE participants SET name = ?, role = ? WHERE id = ? AND room_id = ?").run(newName, newRole, id, room.id);
+          db.prepare("UPDATE participants SET name = ?, role = ?, pin = ? WHERE id = ? AND room_id = ?").run(newName, newRole, newPin, id, room.id);
           if (newRole !== participant.role) {
             db.prepare(`INSERT INTO role_history (room_id, participant_id, participant_name, old_role, new_role, reason, changed_at)
               VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
@@ -1568,7 +1639,7 @@ const server = http.createServer(async (req, res) => {
           db.exec("ROLLBACK");
           throw err;
         }
-        return sendJson(res, 200, { ok: true });
+        return sendJson(res, 200, { ok: true, participant: { id, name: newName, role: newRole, pin: newPin } });
       }
 
       if (judgeAction === "DELETE /api/judge/participants/all" || judgeAction === "POST /api/judge/participants/clear") {

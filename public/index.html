@@ -28,36 +28,43 @@
     <section id="player-view" class="view">
       <div class="panel player-panel">
         
-        <!-- CARD INGRESSO LOBBY (CODICE STANZA + NICKNAME + PIN) -->
+        <!-- CARD INGRESSO LOBBY (CODICE STANZA + PASSWORD/PIN GIOCATORE) -->
         <div id="player-login-panel">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">ACCESSO RAPIDO</p>
+              <p class="eyebrow">ACCESSO RAPIDO GIOCATORE</p>
               <h2>Entra nella Partita</h2>
             </div>
             <span class="seal" aria-hidden="true">🎃</span>
           </div>
-          <p class="section-copy">Inserisci il codice stanza fornito dal tuo Game Master e il tuo nome per unirti alla serata:</p>
+          <p class="section-copy">Inserisci il codice della stanza e la Password / PIN personale che ti ha fornito il tuo Game Master:</p>
 
           <form id="player-room-join-form" class="form-grid">
             <label>Codice Stanza (5 caratteri)
-              <input id="join-room-code" type="text" maxlength="5" autocomplete="off" placeholder="Es. H4LL0" style="text-transform:uppercase; font-weight:700; font-size:1.2rem; letter-spacing:0.15em;" required>
+              <input id="join-room-code" type="text" maxlength="5" autocomplete="off" placeholder="Es. 4VPE4" style="text-transform:uppercase; font-weight:700; font-size:1.2rem; letter-spacing:0.15em;" required>
             </label>
-            <label>Il tuo Nome / Nickname
-              <input id="join-player-name" type="text" maxlength="60" autocomplete="name" placeholder="Es. Marco, Sara, DarkKnight..." required>
-            </label>
-            <label class="wide">PIN personale a 4 cifre (Opzionale)
-              <input id="join-player-pin" type="password" maxlength="10" placeholder="Es. 1234 (per rientrare se chiudi la finestra)">
+            <label>Password / PIN del Giocatore
+              <input id="join-player-pin" type="text" autocomplete="off" placeholder="Es. 4821 (o password)" style="font-weight:700; font-size:1.2rem; letter-spacing:0.1em;" required>
             </label>
             <div class="form-actions wide">
               <button class="button primary" type="submit" style="width:100%; font-size:1.1rem; padding:14px;">Entra nella Partita 🚀</button>
             </div>
           </form>
 
-          <!-- Toggle codice privato legacy -->
-          <div style="margin-top:20px; text-align:center;">
-            <button id="toggle-legacy-player-btn" type="button" class="button quiet" style="font-size:0.85rem;">Hai un vecchio codice privato legacy? Clicca qui</button>
+          <!-- Toggle codice privato legacy o accesso con nickname -->
+          <div style="margin-top:20px; text-align:center; display:flex; justify-content:center; gap:16px; flex-wrap:wrap;">
+            <button id="toggle-name-player-btn" type="button" class="button quiet" style="font-size:0.85rem;">Non hai un PIN? Accedi con Nickname</button>
+            <button id="toggle-legacy-player-btn" type="button" class="button quiet" style="font-size:0.85rem;">Hai un vecchio codice HMAC legacy? Clicca qui</button>
           </div>
+
+          <div id="name-player-box" hidden style="margin-top:12px; padding:12px; background:var(--panel-light); border-radius:8px;">
+            <p style="font-size:0.85rem; margin-top:0; color:var(--muted);">Accesso con Nome / Nickname (se non ti è stato assegnato un PIN):</p>
+            <form id="player-name-join-form" class="inline-form" style="gap:8px;">
+              <input id="join-player-name" type="text" maxlength="60" autocomplete="name" placeholder="Es. Nicola, Marco..." style="flex:1;">
+              <button class="button secondary" type="submit">Entra con Nome</button>
+            </form>
+          </div>
+
           <div id="legacy-player-box" hidden style="margin-top:12px; padding:12px; background:var(--panel-light); border-radius:8px;">
             <form id="player-login-form" class="inline-form">
               <input id="player-code" type="password" autocomplete="off" placeholder="Incolla codice privato HMAC">
@@ -475,11 +482,12 @@
             </div>
             <div class="counter"><strong id="participant-count">0</strong><span>presenti</span></div>
           </div>
-          <p class="section-copy">I giocatori possono entrare da soli inserendo il codice stanza, oppure puoi aggiungerli tu a mano:</p>
+          <p class="section-copy">I giocatori possono entrare inserendo il codice stanza e il loro PIN/Password personale, oppure puoi aggiungerli tu a mano:</p>
           <div class="master-toolbar">
-            <form id="add-participant-form" class="inline-form" style="flex:1;">
+            <form id="add-participant-form" class="inline-form" style="flex:1; gap:8px; flex-wrap:wrap;">
               <label class="sr-only" for="new-participant">Nome partecipante</label>
-              <input id="new-participant" type="text" maxlength="60" placeholder="Aggiungi partecipante a mano (es. Marco...)" required>
+              <input id="new-participant" type="text" maxlength="60" placeholder="Nome partecipante (es. Nicola, Marco...)" required style="flex:2; min-width:180px;">
+              <input id="new-participant-pin" type="text" maxlength="20" placeholder="PIN opzionale (es. 4821)" style="flex:1; min-width:140px; max-width:200px;" title="Se lasciato vuoto, verrà generato automaticamente un PIN a 4 cifre">
               <button class="button secondary" type="submit">+ Aggiungi</button>
             </form>
             <button id="clear-participants-btn" class="button quiet" type="button" title="Rimuovi tutti i partecipanti inseriti">🗑️ Svuota partecipanti</button>

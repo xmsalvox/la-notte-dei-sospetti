@@ -125,6 +125,9 @@ function roleEntries() {
 }
 
 function setActiveView(viewId) {
+  try {
+    localStorage.setItem("activeView", viewId);
+  } catch {}
   document.querySelectorAll(".main-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.view === viewId);
   });
@@ -588,6 +591,7 @@ function startPlayerPolling() {
 // GAME MASTER (MULTI-ROOM & SMART ACTIONS)
 // ----------------------------------------------------
 function showJudgeAuthView() {
+  setActiveView("judge-view");
   document.querySelector("#judge-auth-panel").hidden = false;
   document.querySelector("#judge-rooms-manager").hidden = true;
   document.querySelector("#judge-panel").hidden = true;
@@ -597,6 +601,7 @@ let supervisorRoomsCache = [];
 let isSupervisorViewing = false;
 
 function showJudgeRoomsView() {
+  setActiveView("judge-view");
   document.querySelector("#judge-auth-panel").hidden = true;
   document.querySelector("#judge-rooms-manager").hidden = false;
   document.querySelector("#judge-panel").hidden = true;
@@ -784,6 +789,7 @@ function renderSupervisorRooms(rooms) {
 }
 
 async function enterRoomAsJudge(roomCode) {
+  setActiveView("judge-view");
   currentRoomCode = roomCode;
   localStorage.setItem("currentRoomCode", roomCode);
   document.querySelector("#judge-auth-panel").hidden = true;
@@ -791,9 +797,19 @@ async function enterRoomAsJudge(roomCode) {
   document.querySelector("#judge-panel").hidden = false;
   document.querySelector("#judge-room-code-display").textContent = roomCode;
 
-  await loadJudgeState();
-  await loadMissionTemplates();
-  startJudgePolling();
+  try {
+    await loadJudgeState();
+    await loadMissionTemplates();
+    startJudgePolling();
+  } catch (err) {
+    showToast(err.message);
+    if (err.message.includes("non trovata") || err.message.includes("404") || err.message.includes("Accesso giudice")) {
+      clearInterval(judgeRefresh);
+      currentRoomCode = null;
+      localStorage.removeItem("currentRoomCode");
+      showJudgeRoomsView();
+    }
+  }
 }
 
 async function loadMissionTemplates() {
@@ -838,6 +854,12 @@ async function loadJudgeState(isPolling = false) {
     if (!isPolling) await renderJoinAddresses();
   } catch (error) {
     if (!isPolling) showToast(error.message);
+    if (error.message.includes("non trovata") || error.message.includes("404") || error.message.includes("Accesso giudice richiesto")) {
+      clearInterval(judgeRefresh);
+      currentRoomCode = null;
+      localStorage.removeItem("currentRoomCode");
+      showJudgeRoomsView();
+    }
   }
 }
 
@@ -934,10 +956,52 @@ function renderParticipants() {
       }
     });
 
+    const pinBadge = document.createElement("div");
+    pinBadge.className = "participant-pin-wrap";
+    pinBadge.innerHTML = `<span class="pin-tag" title="Password / PIN giocatore">🔑 <strong>${participant.pin || '—'}</strong></span>`;
+
+    const copyPinBtn = document.createElement("button");
+    copyPinBtn.className = "button quiet copy-btn-sm";
+    copyPinBtn.type = "button";
+    copyPinBtn.textContent = "📋 Copia";
+    copyPinBtn.title = "Copia PIN di accesso";
+    copyPinBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(participant.pin);
+        showToast(`PIN ${participant.pin} copiato per ${participant.name}!`);
+      } catch {
+        showToast(`PIN: ${participant.pin}`);
+      }
+    });
+
+    const editPinBtn = document.createElement("button");
+    editPinBtn.className = "button quiet edit-pin-btn";
+    editPinBtn.type = "button";
+    editPinBtn.textContent = "✏️";
+    editPinBtn.title = "Modifica Password / PIN";
+    editPinBtn.disabled = state.started;
+    editPinBtn.addEventListener("click", async () => {
+      const newPin = window.prompt(`Modifica Password / PIN per ${participant.name}:`, participant.pin || "");
+      if (newPin === null) return;
+      const clean = newPin.trim();
+      if (!clean) return showToast("Il PIN non può essere vuoto.");
+      try {
+        const url = currentRoomCode
+          ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants/${encodeURIComponent(participant.id)}`
+          : `/api/judge/participants/${encodeURIComponent(participant.id)}`;
+        await api(url, { method: "PATCH", body: JSON.stringify({ pin: clean }) });
+        await loadJudgeState();
+        showToast(`PIN aggiornato per ${participant.name}: ${clean}`);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+
     const remove = document.createElement("button");
     remove.className = "remove";
     remove.type = "button";
-    remove.textContent = "✕ Rimuovi";
+    remove.textContent = "✕";
+    remove.title = "Rimuovi partecipante";
     remove.disabled = state.started;
     remove.addEventListener("click", async () => {
       if (!window.confirm(`Rimuovere definitivamente ${participant.name} dalla stanza?`)) return;
@@ -953,7 +1017,7 @@ function renderParticipants() {
       }
     });
 
-    item.append(number, statusDot, input, remove);
+    item.append(number, statusDot, input, pinBadge, copyPinBtn, editPinBtn, remove);
     list.append(item);
   }
   document.querySelector("#participant-count").textContent = state.participants.length;
@@ -1107,22 +1171,45 @@ function renderRoles() {
 
     const accessCell = document.createElement("td");
     accessCell.className = "access-cell";
-    const code = document.createElement("span");
-    code.className = "access-code";
-    code.textContent = participant.accessCode;
+    const pinVal = participant.pin || participant.accessCode;
+    const pinBadge = document.createElement("span");
+    pinBadge.className = "access-code";
+    pinBadge.style.fontWeight = "bold";
+    pinBadge.style.letterSpacing = "0.08em";
+    pinBadge.textContent = `PIN: ${pinVal}`;
+
     const copy = document.createElement("button");
     copy.className = "copy-code";
     copy.type = "button";
-    copy.textContent = "📋 Copia";
+    copy.textContent = "📋 PIN";
+    copy.title = "Copia PIN giocatore";
     copy.addEventListener("click", async () => {
       try {
-        await navigator.clipboard.writeText(participant.accessCode);
-        showToast(`Codice copiato per ${participant.name}.`);
+        await navigator.clipboard.writeText(pinVal);
+        showToast(`PIN copiato per ${participant.name}: ${pinVal}`);
       } catch {
-        showToast(`Codice: ${participant.accessCode}`);
+        showToast(`PIN: ${pinVal}`);
       }
     });
-    accessCell.append(code, copy);
+
+    const copyInvite = document.createElement("button");
+    copyInvite.className = "copy-code";
+    copyInvite.type = "button";
+    copyInvite.textContent = "💬 Invito";
+    copyInvite.title = "Copia invito WhatsApp con PIN per questo giocatore";
+    copyInvite.addEventListener("click", async () => {
+      const roomCode = state.room?.code || currentRoomCode || "H4LL0";
+      const link = `${window.location.origin}/?room=${encodeURIComponent(roomCode)}`;
+      const text = `🎃 *La Notte dei Sospetti*\nCiao ${participant.name}! Sei stato invitato alla partita.\n\n🔗 *Link:* ${link}\n🏰 *Codice Stanza:* ${roomCode}\n🔑 *Il tuo PIN / Password:* ${pinVal}\n\nInserisci il PIN ed entra nella serata! 🕵️`;
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast(`Invito copiato per ${participant.name}!`);
+      } catch {
+        showToast(text);
+      }
+    });
+
+    accessCell.append(pinBadge, copy, copyInvite);
 
     const actionCell = document.createElement("td");
     const isOnline = participant.online;
@@ -1797,14 +1884,62 @@ if (inviteRoom) {
   setActiveView("player-view");
 }
 
-// Player Join Form
+// Player Join Form (ROOM CODE + PLAYER PIN/PASSWORD)
 document.querySelector("#player-room-join-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const roomCode = document.querySelector("#join-room-code").value.trim().toUpperCase();
+  const pin = document.querySelector("#join-player-pin").value.trim();
+  const errorEl = document.querySelector("#player-login-error");
+  errorEl.textContent = "";
+
+  if (!roomCode) {
+    errorEl.textContent = "Inserisci il codice della stanza (5 caratteri).";
+    return;
+  }
+  if (!pin) {
+    errorEl.textContent = "Inserisci la Password / PIN personale fornita dal tuo Game Master.";
+    return;
+  }
+
+  try {
+    const result = await api(`/api/rooms/${encodeURIComponent(roomCode)}/join`, {
+      method: "POST",
+      body: JSON.stringify({ pin }),
+    }, null);
+
+    playerToken = result.token;
+    localStorage.setItem("playerToken", playerToken);
+    showToast(`Benvenuto, ${result.participant.name}!`);
+    await loadPlayerDashboard();
+    startPlayerPolling();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+});
+
+// Toggle name login fallback
+document.querySelector("#toggle-name-player-btn")?.addEventListener("click", () => {
+  const box = document.querySelector("#name-player-box");
+  if (box) box.hidden = !box.hidden;
+});
+
+// Name fallback join form
+document.querySelector("#player-name-join-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const roomCode = document.querySelector("#join-room-code").value.trim().toUpperCase();
   const name = document.querySelector("#join-player-name").value.trim();
   const pin = document.querySelector("#join-player-pin").value.trim() || undefined;
   const errorEl = document.querySelector("#player-login-error");
   errorEl.textContent = "";
+
+  if (!roomCode) {
+    errorEl.textContent = "Inserisci il codice della stanza.";
+    return;
+  }
+  if (!name) {
+    errorEl.textContent = "Inserisci il tuo Nome / Nickname.";
+    return;
+  }
 
   try {
     const result = await api(`/api/rooms/${encodeURIComponent(roomCode)}/join`, {
@@ -1814,6 +1949,7 @@ document.querySelector("#player-room-join-form")?.addEventListener("submit", asy
 
     playerToken = result.token;
     localStorage.setItem("playerToken", playerToken);
+    showToast(`Benvenuto, ${result.participant.name}!`);
     await loadPlayerDashboard();
     startPlayerPolling();
   } catch (err) {
@@ -2218,15 +2354,21 @@ document.querySelector("#mission-template-select")?.addEventListener("change", (
 document.querySelector("#add-participant-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = document.querySelector("#new-participant");
+  const pinInput = document.querySelector("#new-participant-pin");
   const name = input.value.trim();
+  const pin = pinInput ? pinInput.value.trim() : "";
   try {
     const url = currentRoomCode ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/participants` : "/api/judge/participants";
-    await api(url, { method: "POST", body: JSON.stringify({ name }) });
+    const res = await api(url, { method: "POST", body: JSON.stringify({ name, pin: pin || undefined }) });
     input.value = "";
-    document.querySelector("#roster-message").textContent = `✓ ${name} aggiunto alla stanza.`;
+    if (pinInput) pinInput.value = "";
+    const assignedPin = res.participant?.pin || pin || "";
+    document.querySelector("#roster-message").textContent = `✓ ${name} aggiunto (PIN: ${assignedPin}).`;
     await loadJudgeState();
+    showToast(`✓ ${name} aggiunto con PIN: ${assignedPin}`);
   } catch (error) {
     document.querySelector("#roster-message").textContent = error.message;
+    showToast(error.message);
   }
 });
 
@@ -2762,25 +2904,24 @@ document.querySelector("#btn-toggle-broadcast")?.addEventListener("click", () =>
 });
 
 // Auto-init on page load
-if (playerToken) {
-  loadPlayerDashboard().then(() => {
-    setActiveView("player-view");
-    startPlayerPolling();
-  }).catch(() => {
-    playerToken = null;
-    localStorage.removeItem("playerToken");
-  });
-}
+const savedActiveView = localStorage.getItem("activeView") || "player-view";
 
 if (userToken) {
+  setActiveView("judge-view");
   api("/api/auth/me", {}, userToken)
     .then((res) => {
       currentUser = res.user;
       localStorage.setItem("currentUser", JSON.stringify(currentUser));
-      if (currentRoomCode) {
-        enterRoomAsJudge(currentRoomCode);
+      if (savedActiveView === "player-view" && playerToken) {
+        setActiveView("player-view");
+        loadPlayerDashboard().then(() => startPlayerPolling()).catch(() => {});
       } else {
-        showJudgeRoomsView();
+        setActiveView("judge-view");
+        if (currentRoomCode) {
+          enterRoomAsJudge(currentRoomCode);
+        } else {
+          showJudgeRoomsView();
+        }
       }
     })
     .catch(() => {
@@ -2790,8 +2931,24 @@ if (userToken) {
       localStorage.removeItem("userToken");
       localStorage.removeItem("currentUser");
       localStorage.removeItem("currentRoomCode");
-      showJudgeAuthView();
+      if (savedActiveView === "judge-view") {
+        showJudgeAuthView();
+      } else {
+        setActiveView("player-view");
+      }
     });
 } else if (judgeToken) {
+  setActiveView("judge-view");
   enterRoomAsJudge(currentRoomCode || "H4LL0");
+} else if (playerToken) {
+  loadPlayerDashboard().then(() => {
+    setActiveView("player-view");
+    startPlayerPolling();
+  }).catch(() => {
+    playerToken = null;
+    localStorage.removeItem("playerToken");
+    setActiveView(savedActiveView);
+  });
+} else {
+  setActiveView(savedActiveView);
 }
