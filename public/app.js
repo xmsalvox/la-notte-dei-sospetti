@@ -1086,6 +1086,9 @@ function renderRoleConfiguration() {
           ? `/api/rooms/${encodeURIComponent(currentRoomCode)}/judge/roles/${encodeURIComponent(key)}`
           : `/api/judge/roles/${encodeURIComponent(key)}`;
         await api(url, { method: "DELETE" });
+        if (document.querySelector("#role-edit-id")?.value === key) {
+          resetRoleForm();
+        }
         await loadJudgeState();
         showToast(`Ruolo "${label}" eliminato.`);
       } catch (error) {

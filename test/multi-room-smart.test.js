@@ -217,3 +217,70 @@ test("multi-room: user auth, room creation, player lobby, auto-balance, shuffle 
   assert.equal(supRoomInspect.body.room.code, roomCode);
   assert.equal(supRoomInspect.body.participants.length, 5);
 });
+
+test("deleting a role or participant in a room deletes the role/participant, NOT the room", async () => {
+  // 1. Create a GM and room
+  const reg = await request("/api/auth/register", {
+    method: "POST",
+    body: { username: "RoleTestGM", password: "password123" },
+  });
+  const gmToken = reg.body.token;
+
+  const roomRes = await request("/api/rooms", {
+    method: "POST",
+    token: gmToken,
+    body: { name: "Role Deletion Test Room" },
+  });
+  const code = roomRes.body.room.code;
+
+  // Add a participant
+  const partJoin = await request(`/api/rooms/${code}/join`, {
+    method: "POST",
+    body: { name: "TestParticipant", pin: "9999" },
+  });
+  assert.equal(partJoin.status, 200);
+  const partId = partJoin.body.participant.id;
+
+  // Verify initial state has roles
+  const initialState = await request(`/api/rooms/${code}/judge/state`, { token: gmToken });
+  assert.equal(initialState.status, 200);
+  assert.ok("veggente" in initialState.body.roles);
+
+  // 2. Delete role 'veggente' via the room-scoped endpoint used by the UI
+  const deleteRoleRes = await request(`/api/rooms/${code}/judge/roles/veggente`, {
+    method: "DELETE",
+    token: gmToken,
+  });
+  assert.equal(deleteRoleRes.status, 200);
+  assert.equal(deleteRoleRes.body.ok, true);
+
+  // 3. Verify room STILL EXISTS!
+  const afterRoleDelete = await request(`/api/rooms/${code}/judge/state`, { token: gmToken });
+  assert.equal(afterRoleDelete.status, 200, "Room must NOT be deleted after deleting a role!");
+  assert.equal(afterRoleDelete.body.room.code, code);
+  assert.ok(!("veggente" in afterRoleDelete.body.roles), "Veggente role must be removed");
+
+  // 4. Delete participant via room-scoped endpoint
+  const deletePartRes = await request(`/api/rooms/${code}/judge/participants/${partId}?force=true`, {
+    method: "DELETE",
+    token: gmToken,
+  });
+  assert.equal(deletePartRes.status, 200);
+  assert.equal(deletePartRes.body.ok, true);
+
+  // 5. Verify room STILL EXISTS after participant deletion!
+  const afterPartDelete = await request(`/api/rooms/${code}/judge/state`, { token: gmToken });
+  assert.equal(afterPartDelete.status, 200, "Room must NOT be deleted after deleting a participant!");
+  assert.equal(afterPartDelete.body.participants.length, 0);
+
+  // 6. Deleting the room explicitly via DELETE /api/rooms/:code deletes only the room
+  const deleteRoomRes = await request(`/api/rooms/${code}`, {
+    method: "DELETE",
+    token: gmToken,
+  });
+  assert.equal(deleteRoomRes.status, 200);
+
+  // Room now properly 404s
+  const checkGone = await request(`/api/rooms/${code}/judge/state`, { token: gmToken });
+  assert.equal(checkGone.status, 404);
+});

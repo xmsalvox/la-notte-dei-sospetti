@@ -1051,9 +1051,10 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { rooms });
     }
 
-    if (route.startsWith("DELETE /api/supervisor/rooms/")) {
+    const supervisorRoomDeleteMatch = route.match(/^DELETE \/api\/supervisor\/rooms\/([^/]+)\/?$/);
+    if (supervisorRoomDeleteMatch) {
       if (!requireSupervisor(req, res)) return;
-      const code = decodeURIComponent(url.pathname.split("/").pop());
+      const code = decodeURIComponent(supervisorRoomDeleteMatch[1]);
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
       db.prepare("DELETE FROM rooms WHERE id = ?").run(room.id);
@@ -1092,8 +1093,9 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (route.startsWith("GET /api/rooms/") && !route.includes("/judge") && !route.includes("/join")) {
-      const code = url.pathname.split("/")[3];
+    const roomGetMatch = route.match(/^GET \/api\/rooms\/([^/]+)\/?$/);
+    if (roomGetMatch) {
+      const code = decodeURIComponent(roomGetMatch[1]);
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
       const count = db.prepare("SELECT COUNT(*) AS count FROM participants WHERE room_id = ?").get(room.id).count;
@@ -1102,10 +1104,11 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (route.startsWith("DELETE /api/rooms/")) {
+    const roomDeleteMatch = route.match(/^DELETE \/api\/rooms\/([^/]+)\/?$/);
+    if (roomDeleteMatch) {
       const userId = requireUser(req, res);
       if (!userId) return;
-      const code = decodeURIComponent(url.pathname.split("/")[3]);
+      const code = decodeURIComponent(roomDeleteMatch[1]);
       const room = getRoomByCode(code);
       if (!room) return sendJson(res, 404, { error: "Stanza non trovata." });
       if (room.owner_id !== userId && !isSupervisor(req)) {
@@ -1595,7 +1598,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (judgeAction.startsWith("PATCH /api/judge/participants/")) {
-        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const id = decodeURIComponent(judgeAction.replace(/^PATCH \/api\/judge\/participants\//, "").replace(/\/+$/, ""));
         const participant = db.prepare("SELECT * FROM participants WHERE id = ? AND room_id = ?").get(id, room.id);
         if (!participant) return sendJson(res, 404, { error: "Partecipante non trovato." });
         const body = await readJson(req);
@@ -1670,7 +1673,7 @@ const server = http.createServer(async (req, res) => {
         if (room.status === "running" && room.current_turn > 0 && !force) {
           return sendJson(res, 409, { error: "I partecipanti non si possono rimuovere durante un turno in corso." });
         }
-        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const id = decodeURIComponent(judgeAction.replace(/^DELETE \/api\/judge\/participants\//, "").replace(/\/+$/, ""));
         db.exec("BEGIN IMMEDIATE");
         try {
           db.prepare("DELETE FROM messages WHERE room_id = ? AND participant_id = ?").run(room.id, id);
@@ -1742,7 +1745,7 @@ const server = http.createServer(async (req, res) => {
 
       if (judgeAction.startsWith("PATCH /api/judge/roles/")) {
         if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const id = decodeURIComponent(judgeAction.replace(/^PATCH \/api\/judge\/roles\//, "").replace(/\/+$/, ""));
         const role = db.prepare("SELECT * FROM game_roles WHERE id = ? AND room_id = ?").get(id, room.id);
         if (!role) return sendJson(res, 404, { error: "Ruolo non trovato." });
         const body = await readJson(req);
@@ -1764,7 +1767,7 @@ const server = http.createServer(async (req, res) => {
 
       if (judgeAction.startsWith("DELETE /api/judge/roles/")) {
         if (room.started_at) return sendJson(res, 409, { error: "I ruoli non si possono modificare dopo l'inizio." });
-        const id = decodeURIComponent(url.pathname.split("/").pop());
+        const id = decodeURIComponent(judgeAction.replace(/^DELETE \/api\/judge\/roles\//, "").replace(/\/+$/, ""));
         db.exec("BEGIN IMMEDIATE");
         try {
           db.prepare("UPDATE participants SET role = NULL WHERE role = ? AND room_id = ?").run(id, room.id);
